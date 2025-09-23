@@ -1,0 +1,34 @@
+# AI Educational - PDF to Embeddings Converter (Optimizat)
+# Requirements pentru codul optimizat cu BGE-M3 si Railway deployment
+
+# Core ML si embeddings - optimizat pentru BGE/GTE
+torch>=2.0.0,<2.3.0
+sentence-transformers>=2.2.0
+transformers>=4.21.0,<5.0.0
+langchain>=0.0.300
+
+# Database pentru embeddings - versiune stabila
+chromadb>=0.4.15,<0.5.0
+
+# PDF processing - doar cele folosite efectiv, optimizat
+PyPDF2>=3.0.0,<4.0.0
+pdfplumber>=0.7.0,<1.0.0
+pymupdf>=1.23.0,<2.0.0
+
+# Utilities - versiuni stabile
+numpy>=1.21.0,<2.0.0
+tqdm>=4.62.0
+psutil>=5.8.0  # Pentru monitoring memorie în teste
+
+# Python compatibility
+typing_extensions>=4.5.0
+
+# Pentru Railway deployment API
+fastapi>=0.68.0,<1.0.0
+uvicorn[standard]>=0.15.0,<1.0.0
+pydantic>=1.8.0,<2.0.0
+python-multipart>=0.0.5
+
+# Pentru storage cloud (optional)
+# boto3>=1.26.0  # Pentru S3
+# google-cloud-storage>=2.7.0  # Pentru GCS
