@@ -8,6 +8,7 @@ import gc
 import logging
 import contextlib
 import psutil
+import unicodedata
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -17,13 +18,10 @@ from config import (
 )
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Callable
+from typing import List, Dict, Tuple, Optional, Callable, Iterable, Iterator
 import PyPDF2
 import pdfplumber
 import fitz  # PyMuPDF
-import pytesseract
-from pdf2image import convert_from_path
-from PIL import Image
 import torch
 from sentence_transformers import SentenceTransformer
 import chromadb
@@ -43,6 +41,45 @@ except ImportError:
 
 # Instrucțiunea pentru BGE/GTE în modul retrieval
 RETRIEVAL_INSTRUCTION = "Represent this sentence for retrieval: "
+
+
+class HashingSentenceEmbedder:
+    """Fallback simplu pentru generarea de embeddings fără dependențe externe."""
+
+    def __init__(self, dimension: int = 384):
+        self.dimension = max(32, dimension)
+
+    def encode(
+        self,
+        sentences: List[str],
+        normalize_embeddings: bool = True,
+        show_progress_bar: bool = False,
+        convert_to_numpy: bool = True,
+    ) -> np.ndarray:
+        embeddings = np.zeros((len(sentences), self.dimension), dtype=np.float32)
+
+        for row, sentence in enumerate(sentences):
+            if not sentence:
+                continue
+
+            tokens = re.findall(r"\w+", sentence.lower())
+            if not tokens:
+                continue
+
+            for token in tokens:
+                token_hash = int(hashlib.sha256(token.encode("utf-8")).hexdigest(), 16)
+                index = token_hash % self.dimension
+                embeddings[row, index] += 1.0
+
+            if normalize_embeddings:
+                norm = np.linalg.norm(embeddings[row])
+                if norm > 0:
+                    embeddings[row] /= norm
+
+        return embeddings
+
+    def get_sentence_embedding_dimension(self) -> int:
+        return self.dimension
 
 # Data classes pentru monitoring
 @dataclass
@@ -116,11 +153,18 @@ def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 
 class PDFEmbeddingsConverter:
     def __init__(self, embeddings_db_path: str = "./embeddings_db"):
         logger.info("Initializing optimized PDF converter...")
-        
+
         self.embeddings_db_path = embeddings_db_path
         self.processed_files_path = os.path.join(embeddings_db_path, "processed_files.json")
         self._file_lock = threading.Lock()  # Lock pentru thread safety la processed_files.json
-        
+
+        self.allow_online_model_download = os.getenv("ALLOW_ONLINE_MODEL_DOWNLOAD", "0") == "1"
+        if not self.allow_online_model_download:
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+            os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+            os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
         # Health checks la startup
         self._validate_environment()
         self._check_disk_space()
@@ -134,8 +178,30 @@ class PDFEmbeddingsConverter:
         
         logger.info(f"Loading {EMBEDDING_CONFIG.model} model...")
         with memory_managed_processing():
-            self.model = SentenceTransformer(EMBEDDING_CONFIG.model)
-        
+            local_model_path = os.getenv("LOCAL_SENTENCE_MODEL_PATH")
+
+            if self.allow_online_model_download or local_model_path:
+                model_source = local_model_path or EMBEDDING_CONFIG.model
+                try:
+                    self.model = SentenceTransformer(model_source)
+                    self.using_fallback_model = False
+                    self.embedding_model_name = Path(model_source).name or EMBEDDING_CONFIG.model
+                except Exception as exc:
+                    logger.warning(
+                        "Could not load SentenceTransformer model (%s). Falling back to hashing embeddings.",
+                        exc,
+                    )
+                    self.model = HashingSentenceEmbedder(EMBEDDING_CONFIG.fallback_dimension)
+                    self.using_fallback_model = True
+                    self.embedding_model_name = f"hashing-{EMBEDDING_CONFIG.fallback_dimension}"
+            else:
+                logger.info(
+                    "Offline mode detected - using hashing-based embeddings. Set ALLOW_ONLINE_MODEL_DOWNLOAD=1 for SentenceTransformer."
+                )
+                self.model = HashingSentenceEmbedder(EMBEDDING_CONFIG.fallback_dimension)
+                self.using_fallback_model = True
+                self.embedding_model_name = f"hashing-{EMBEDDING_CONFIG.fallback_dimension}"
+
         logger.info("Initializing ChromaDB with cosine metric...")
         with retry_on_failure(max_retries=3):
             self.client = chromadb.PersistentClient(path=embeddings_db_path)
@@ -177,12 +243,16 @@ class PDFEmbeddingsConverter:
     def _check_disk_space(self):
         """Verifică spațiul disk disponibil"""
         try:
-            disk = psutil.disk_usage(self.embeddings_db_path)
+            target_path = self.embeddings_db_path
+            if not os.path.exists(target_path):
+                os.makedirs(target_path, exist_ok=True)
+
+            disk = psutil.disk_usage(target_path)
             free_gb = disk.free / (1024**3)
-            
+
             if free_gb < PROCESSING_CONFIG.disk_space_threshold_gb:
                 raise RuntimeError(f"Insufficient disk space: {free_gb:.1f}GB available (threshold: {PROCESSING_CONFIG.disk_space_threshold_gb}GB)")
-            
+
             logger.info(f"Disk space check: {free_gb:.1f}GB available")
         except Exception as e:
             logger.error(f"Disk space check failed: {e}")
@@ -245,16 +315,19 @@ class PDFEmbeddingsConverter:
             print(f"Eroare test: {e}")
             return False
 
-    def get_optimal_batch_size(self, chunk_count: int) -> int:
+    def get_optimal_batch_size(self, chunk_count: Optional[int] = None) -> int:
         """Calculează batch size optim bazat pe memoria disponibilă și numărul de chunks"""
         try:
             memory_percent = psutil.virtual_memory().percent
             available_gb = psutil.virtual_memory().available / (1024**3)
             cpu_count = psutil.cpu_count()
-            
+
             # Logică îmbunătățită pentru batch sizing
             base_batch = 16
-            
+
+            if chunk_count is None:
+                chunk_count = 0
+
             # Ajustare bazată pe memorie
             if memory_percent > 85:
                 base_batch = 4   # Foarte conservativ
@@ -379,120 +452,207 @@ class PDFEmbeddingsConverter:
                 
         except Exception as e:
             return False, f"Eroare verificare: {e}"
+
+    # -------- Text extraction helpers (stream friendly) --------
+
+    def _clean_page_text(self, text: str) -> str:
+        """Normalizează textul extras pentru a reduce caracterele inutile."""
+        if not text:
+            return ""
+
+        text = unicodedata.normalize("NFKC", text)
+        text = unicodedata.normalize("NFKD", text)
+        text = text.encode("ascii", "ignore").decode("ascii")
+        text = text.replace("\x00", " ").replace("\xa0", " ")
+        text = text.replace("\r", "\n")
+        text = re.sub(r"-\s*\n", "", text)  # Unește cuvintele despărțite la capăt de linie
+        text = re.sub(r"\n+", "\n", text)
+        text = re.sub(r"[\t\u200b]+", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        cleaned = "".join(ch for ch in text if ch.isprintable() or ch in "\n ")
+        return cleaned.strip()
+
+    def _stream_text_fitz(self, pdf_path: str) -> Iterator[Tuple[str, int]]:
         try:
-            start_time = time.time()
-            # Test cu instrucțiunea de retrieval și normalizare
-            embedding = self.model.encode(
-                [RETRIEVAL_INSTRUCTION + "Test simplu pentru verificare"],
-                normalize_embeddings=True
-            )
-            duration = time.time() - start_time
-            print(f"Test embedding optimizat: {embedding.shape}, timp: {duration:.2f}s")
-            
-            # Estimare pentru 162 chunks
-            estimated_total = duration * 162
-            print(f"Estimare pentru 162 chunks: {estimated_total/60:.1f} minute")
-            return True
-        except Exception as e:
-            print(f"Eroare test: {e}")
-            return False
-    
-    def extract_text_with_pages(self, pdf_path: str) -> Tuple[str, List[Tuple[str, int]]]:
-        """Extrage text cu informații despre pagini - cu fallback OCR pentru PDF-uri dificile"""
-        print(f"Procesez cu metode multiple: {os.path.basename(pdf_path)}")
-        
-        # Verifică dacă PDF-ul are text extractabil
+            doc = fitz.open(pdf_path)
+        except Exception as exc:
+            logger.warning(f"PyMuPDF open failed: {exc}")
+            return iter([])
+
+        try:
+            for page_index in range(len(doc)):
+                page = doc.load_page(page_index)
+                text = page.get_text("text") or ""
+                cleaned = self._clean_page_text(text)
+                if cleaned:
+                    yield cleaned, page_index + 1
+        finally:
+            doc.close()
+
+    def _stream_text_pdfplumber(self, pdf_path: str) -> Iterator[Tuple[str, int]]:
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_index, page in enumerate(pdf.pages):
+                    text = page.extract_text() or ""
+                    cleaned = self._clean_page_text(text)
+                    if cleaned:
+                        yield cleaned, page_index + 1
+        except Exception as exc:
+            logger.warning(f"pdfplumber failed: {exc}")
+            return iter([])
+
+    def _stream_text_pypdf2(self, pdf_path: str) -> Iterator[Tuple[str, int]]:
+        try:
+            with open(pdf_path, "rb") as file:
+                reader = PyPDF2.PdfReader(file)
+                for page_index, page in enumerate(reader.pages):
+                    try:
+                        text = page.extract_text() or ""
+                    except Exception:
+                        text = ""
+                    cleaned = self._clean_page_text(text)
+                    if cleaned:
+                        yield cleaned, page_index + 1
+        except Exception as exc:
+            logger.warning(f"PyPDF2 failed: {exc}")
+            return iter([])
+
+    def _stream_text_ocr(self, pdf_path: str, max_pages: int = 50) -> Iterator[Tuple[str, int]]:
+        if not (self.ocr_available and self.tesseract_available and self.poppler_available):
+            return iter([])
+
+        raw_text = self.extract_text_with_ocr(pdf_path, max_pages=max_pages)
+        if not raw_text:
+            return iter([])
+
+        page_number = None
+        buffer: List[str] = []
+
+        page_pattern = re.compile(r"--- Page (\d+) ---")
+        for line in raw_text.splitlines():
+            match = page_pattern.match(line.strip())
+            if match:
+                if buffer and page_number is not None:
+                    cleaned = self._clean_page_text(" ".join(buffer))
+                    if cleaned:
+                        yield cleaned, page_number
+                page_number = int(match.group(1))
+                buffer = []
+            else:
+                buffer.append(line)
+
+        if buffer and page_number is not None:
+            cleaned = self._clean_page_text(" ".join(buffer))
+            if cleaned:
+                yield cleaned, page_number
+
+    def stream_text_with_pages(self, pdf_path: str) -> Iterator[Tuple[str, int]]:
+        """Generează textul pagină cu pagină folosind prima metodă care reușește."""
         is_extractable, reason = self.is_pdf_text_extractable(pdf_path)
-        print(f"📋 Analiza PDF: {reason}")
-        
-        # Metodă 1: PyMuPDF (cea mai rapidă)
+        logger.info(f"Text analysis for {os.path.basename(pdf_path)}: {reason}")
+
+        extraction_methods: List[Tuple[str, Callable[[str], Iterable[Tuple[str, int]]]]] = []
         if is_extractable:
-            try:
-                print("🔄 Metoda 1: PyMuPDF...")
-                text_pages = []
-                doc = fitz.open(pdf_path)
-                for page_num in range(len(doc)):
-                    page = doc.load_page(page_num)
-                    page_text = page.get_text()
-                    if page_text:
-                        text_pages.append((page_text, page_num + 1))
-                doc.close()
-                
-                if text_pages:
-                    full_text = "\n".join([text for text, _ in text_pages])
-                    print(f"✅ PyMuPDF succes: {len(full_text)} caractere din {len(text_pages)} pagini")
-                    return full_text.strip(), text_pages
-                else:
-                    print("⚠️ PyMuPDF: Nu s-a extras text")
-            except Exception as e:
-                print(f"⚠️ PyMuPDF eroare: {e}")
-        
-        # Metodă 2: pdfplumber (backup pentru PDF-uri complexe)
-        if is_extractable:
-            try:
-                print("🔄 Metoda 2: pdfplumber...")
-                text = ""
-                with pdfplumber.open(pdf_path) as pdf:
-                    for page_num, page in enumerate(pdf.pages):
-                        page_text = page.extract_text()
-                        if page_text:
-                            text += page_text + "\n"
-                
-                if text.strip():
-                    print(f"✅ pdfplumber succes: {len(text)} caractere")
-                    estimated_pages = [(text, 1)]  # Simplificat pentru pdfplumber
-                    return text.strip(), estimated_pages
-                else:
-                    print("⚠️ pdfplumber: Nu s-a extras text")
-            except Exception as e:
-                print(f"⚠️ pdfplumber eroare: {e}")
-        
-        # Metodă 3: PyPDF2 (ultimă încercare pentru text)
-        if is_extractable:
-            try:
-                print("🔄 Metoda 3: PyPDF2...")
-                text = ""
-                with open(pdf_path, 'rb') as file:
-                    pdf_reader = PyPDF2.PdfReader(file)
-                    for page_num, page in enumerate(pdf_reader.pages):
-                        page_text = page.extract_text()
-                        if page_text:
-                            text += page_text + "\n"
-                
-                if text.strip():
-                    print(f"✅ PyPDF2 succes: {len(text)} caractere")
-                    estimated_pages = [(text, 1)]
-                    return text.strip(), estimated_pages
-                else:
-                    print("⚠️ PyPDF2: Nu s-a extras text")
-            except Exception as e:
-                print(f"⚠️ PyPDF2 eroare: {e}")
-        
-        # Metodă 4: OCR (pentru PDF-uri scanate sau cu imagini)
-        if self.ocr_available and self.tesseract_available and self.poppler_available:
-            try:
-                print("🔄 Metoda 4: OCR (Tesseract)...")
-                # Limitează la primele 50 de pagini pentru OCR (pentru a evita timpii foarte lungi)
-                ocr_text = self.extract_text_with_ocr(pdf_path, max_pages=50)
-                
-                if ocr_text.strip():
-                    print(f"✅ OCR succes: {len(ocr_text)} caractere")
-                    ocr_pages = [(ocr_text, 1)]  # Simplificat pentru OCR
-                    return ocr_text.strip(), ocr_pages
-                else:
-                    print("⚠️ OCR: Nu s-a extras text")
-            except Exception as e:
-                print(f"⚠️ OCR eroare: {e}")
+            extraction_methods.extend([
+                ("PyMuPDF", self._stream_text_fitz),
+                ("pdfplumber", self._stream_text_pdfplumber),
+                ("PyPDF2", self._stream_text_pypdf2),
+            ])
         else:
-            print("⚠️ OCR nu este disponibil pentru PDF-uri dificile")
-        
-        print("❌ Toate metodele au eșuat - nu s-a putut extrage text")
-        return "", []
-    
-    def advanced_chunk_text(self, text: str, text_pages: List[Tuple[str, int]], 
+            logger.info("Direct text extraction likely to fail, trying OCR fallback")
+
+        extraction_methods.append(("OCR", self._stream_text_ocr))
+
+        for method_name, method in extraction_methods:
+            yielded = False
+            try:
+                for page_text, page_number in method(pdf_path):
+                    if not yielded:
+                        logger.info(f"Using {method_name} for {os.path.basename(pdf_path)}")
+                    yielded = True
+                    yield page_text, page_number
+            except Exception as exc:
+                logger.warning(f"{method_name} extraction failed: {exc}")
+                yielded = False
+
+            if yielded:
+                return
+
+        logger.error(f"All extraction methods failed for {os.path.basename(pdf_path)}")
+
+    def extract_text_with_pages(self, pdf_path: str) -> Tuple[str, List[Tuple[str, int]]]:
+        """Extrage textul integral folosind fluxul de pagini."""
+        text_pages = list(self.stream_text_with_pages(pdf_path))
+        if not text_pages:
+            return "", []
+
+        full_text = "\n".join(page_text for page_text, _ in text_pages)
+        return full_text.strip(), text_pages
+
+    def stream_chunks(
+        self,
+        pdf_path: str,
+        chunk_size: Optional[int] = None,
+        overlap: Optional[int] = None,
+        min_words: int = 40,
+    ) -> Iterator[Tuple[str, Dict[str, int]]]:
+        """Generează chunk-uri din PDF fără a încărca întregul fișier în memorie."""
+
+        if chunk_size is None:
+            chunk_size = EMBEDDING_CONFIG.chunk_size
+        if overlap is None:
+            overlap = EMBEDDING_CONFIG.overlap
+
+        if chunk_size <= 0:
+            raise ValueError("chunk_size trebuie să fie > 0")
+
+        word_buffer: List[Tuple[str, int]] = []
+
+        for page_text, page_number in self.stream_text_with_pages(pdf_path):
+            words = page_text.split()
+            if not words:
+                continue
+
+            word_buffer.extend((word, page_number) for word in words)
+
+            while len(word_buffer) >= chunk_size:
+                chunk_slice = word_buffer[:chunk_size]
+                chunk_words = [word for word, _ in chunk_slice]
+
+                if len(chunk_words) < min_words:
+                    break
+
+                chunk_text = " ".join(chunk_words)
+                chunk_metadata = {
+                    "page_from": chunk_slice[0][1],
+                    "page_to": chunk_slice[-1][1],
+                    "sentence_count": max(1, len(re.split(r"[.!?]", chunk_text)) - 1),
+                    "word_count": len(chunk_words),
+                }
+
+                yield chunk_text, chunk_metadata
+
+                if overlap > 0:
+                    word_buffer = word_buffer[chunk_size - overlap :]
+                else:
+                    word_buffer = []
+
+        # Procesează cuvintele rămase
+        if len(word_buffer) >= max(min_words, 1):
+            chunk_words = [word for word, _ in word_buffer]
+            chunk_text = " ".join(chunk_words)
+            chunk_metadata = {
+                "page_from": word_buffer[0][1],
+                "page_to": word_buffer[-1][1],
+                "sentence_count": max(1, len(re.split(r"[.!?]", chunk_text)) - 1),
+                "word_count": len(chunk_words),
+            }
+            yield chunk_text, chunk_metadata
+
+    def advanced_chunk_text(self, text: str, text_pages: List[Tuple[str, int]],
                        chunk_size: int = None, overlap: int = None) -> Tuple[List[str], List[Dict]]:
         """Chunking îmbunătățit cu LangChain pentru conținut educațional"""
-        
+
         # Folosește configurația dinamică dacă nu sunt specificate parametrii
         if chunk_size is None:
             chunk_size = EMBEDDING_CONFIG.chunk_size
@@ -697,124 +857,156 @@ class PDFEmbeddingsConverter:
         """Generează ID-uri stabile pentru evitarea coliziunilor"""
         collection_name = self.get_collection_name(file_path)
         return f"{collection_name}_{file_hash[:8]}_{chunk_index}"
-    
+
+    def _persist_embeddings_batch(
+        self,
+        collection,
+        chunk_texts: List[str],
+        metadatas: List[Dict],
+        ids: List[str],
+    ) -> None:
+        """Cod reutilizabil pentru a salva un batch de embeddings."""
+        if not chunk_texts:
+            return
+
+        with retry_on_failure(max_retries=3, delay=1.0):
+            prefixed_chunks = [RETRIEVAL_INSTRUCTION + chunk for chunk in chunk_texts]
+            embeddings = self.model.encode(
+                prefixed_chunks,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+
+            collection.add(
+                embeddings=embeddings.tolist(),
+                documents=chunk_texts,
+                metadatas=metadatas,
+                ids=ids,
+            )
+
+        # Cleanup memorie
+        del prefixed_chunks, embeddings
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def process_pdf(self, pdf_path: str, progress_callback=None) -> bool:
         """Procesează PDF cu toate optimizările, progress tracking și resume capability"""
         start_time = time.time()
         file_hash = self.get_file_hash(pdf_path)
-        
+
         # Verifică dacă e deja procesat
         if pdf_path in self.processed_files and self.processed_files[pdf_path] == file_hash:
             logger.info(f"File already processed - skipping: {os.path.basename(pdf_path)}")
             return True
-        
+
         logger.info(f"Processing optimized: {os.path.basename(pdf_path)}")
-        
+
         try:
             with memory_managed_processing():
-                # Step 1: Extract text with progress tracking
                 if progress_callback:
-                    progress_callback(0.1, "Extracting text from PDF...")
-                
-                text, text_pages = self.extract_text_with_pages(pdf_path)
-                if not text:
-                    logger.error("Could not extract text from PDF")
-                    return False
-                
-                logger.info(f"Text extracted: {len(text)} characters from {len(text_pages)} pages")
-                
-                # Step 2: Advanced chunking
-                if progress_callback:
-                    progress_callback(0.3, "Creating text chunks...")
-                
-                chunks, chunk_metadata = self.advanced_chunk_text(text, text_pages)
-                if not chunks:
-                    logger.error("Could not create chunks")
-                    return False
-                
-                logger.info(f"Created {len(chunks)} chunks")
-                
-                # Step 3: Generate embeddings with progress tracking
-                if progress_callback:
-                    progress_callback(0.5, "Generating embeddings...")
-                
-                embeddings = self.generate_embeddings_streaming(chunks)
-                if embeddings.size == 0:
-                    logger.error("Could not generate embeddings")
-                    return False
-                
-                logger.info(f"Generated embeddings: {embeddings.shape}")
-                
-                # Step 4: Save to ChromaDB with retry logic
-                if progress_callback:
-                    progress_callback(0.8, "Saving to database...")
-                
+                    progress_callback(0.05, "Analyzing PDF structure...")
+
                 collection_name = self.get_collection_name(pdf_path)
-                logger.info(f"Saving to optimized collection: {collection_name}")
-                
                 with retry_on_failure(max_retries=3, delay=2.0):
                     collection = self.client.get_or_create_collection(
                         name=collection_name,
                         metadata={
-                            "hnsw:space": "cosine",  # Forțează metrică cosine
+                            "hnsw:space": "cosine",
                             "description": f"Optimized embeddings for {pdf_path}",
                             "created_at": datetime.now().isoformat(),
-                            "chunk_count": len(chunks),
-                            "model": EMBEDDING_CONFIG.model,
+                            "chunk_count": 0,
+                            "model": self.embedding_model_name,
                             "retrieval_instruction": True,
                             "normalized": True,
-                            "file_hash": file_hash
-                        }
+                            "file_hash": file_hash,
+                        },
                     )
-                    
-                    # Construiește metadate complete
-                    metadatas = []
-                    for i, chunk_meta in enumerate(chunk_metadata):
-                        metadata = {
-                            "source_file": pdf_path,
-                            "chunk_index": i,
-                            "processed_at": datetime.now().isoformat(),
-                            "page_from": chunk_meta["page_from"],
-                            "page_to": chunk_meta["page_to"],
-                            "sentence_count": chunk_meta["sentence_count"],
-                            "word_count": chunk_meta["word_count"],
-                            "file_hash": file_hash
-                        }
-                        metadatas.append(metadata)
-                    
-                    # Generează ID-uri stabile
-                    ids = [self.generate_stable_id(pdf_path, i, file_hash) for i in range(len(chunks))]
-                    
-                    # Salvează în batch-uri cu dynamic batch sizing
-                    optimal_batch_size = min(DB_CONFIG.batch_size, self.get_optimal_batch_size(len(chunks)))
-                    for i in range(0, len(chunks), optimal_batch_size):
-                        end_idx = min(i + optimal_batch_size, len(chunks))
-                        
-                        with retry_on_failure(max_retries=2, delay=1.0):
-                            collection.add(
-                                embeddings=embeddings[i:end_idx].tolist(),
-                                documents=chunks[i:end_idx],
-                                metadatas=metadatas[i:end_idx],
-                                ids=ids[i:end_idx]
+
+                optimal_batch_size = max(
+                    1, min(DB_CONFIG.batch_size, self.get_optimal_batch_size())
+                )
+                chunk_buffer: List[str] = []
+                metadata_buffer: List[Dict] = []
+                id_buffer: List[str] = []
+                chunk_count = 0
+                words_total = 0
+
+                for chunk_text, chunk_meta in self.stream_chunks(pdf_path):
+                    if progress_callback and chunk_count == 0:
+                        progress_callback(0.25, "Chunking text and generating embeddings...")
+
+                    metadata = {
+                        "source_file": pdf_path,
+                        "chunk_index": chunk_count,
+                        "processed_at": datetime.now().isoformat(),
+                        "page_from": chunk_meta["page_from"],
+                        "page_to": chunk_meta["page_to"],
+                        "sentence_count": chunk_meta["sentence_count"],
+                        "word_count": chunk_meta["word_count"],
+                        "file_hash": file_hash,
+                    }
+
+                    chunk_buffer.append(chunk_text)
+                    metadata_buffer.append(metadata)
+                    id_buffer.append(self.generate_stable_id(pdf_path, chunk_count, file_hash))
+
+                    chunk_count += 1
+                    words_total += chunk_meta["word_count"]
+
+                    if len(chunk_buffer) >= optimal_batch_size:
+                        self._persist_embeddings_batch(
+                            collection, chunk_buffer, metadata_buffer, id_buffer
+                        )
+                        chunk_buffer.clear()
+                        metadata_buffer.clear()
+                        id_buffer.clear()
+
+                        if progress_callback:
+                            progress_callback(
+                                min(0.9, 0.25 + chunk_count * 0.01),
+                                f"Stored {chunk_count} chunks...",
                             )
-                    
-                    logger.info(f"Saved {len(chunks)} chunks to ChromaDB")
-                
-                # Step 5: Mark as processed
-                if progress_callback:
-                    progress_callback(0.95, "Finalizing...")
-                
+
+                if chunk_buffer:
+                    self._persist_embeddings_batch(
+                        collection, chunk_buffer, metadata_buffer, id_buffer
+                    )
+
+                if chunk_count == 0:
+                    logger.error("Could not create any chunks from PDF")
+                    return False
+
+                try:
+                    updated_metadata = {
+                        **(collection.metadata or {}),
+                        "description": f"Optimized embeddings for {pdf_path}",
+                        "chunk_count": chunk_count,
+                        "model": self.embedding_model_name,
+                        "retrieval_instruction": True,
+                        "normalized": True,
+                        "file_hash": file_hash,
+                        "words_total": words_total,
+                        "updated_at": datetime.now().isoformat(),
+                    }
+                    collection.modify(metadata=updated_metadata)
+                except Exception as exc:
+                    logger.warning(f"Could not update collection metadata: {exc}")
+
                 self.processed_files[pdf_path] = file_hash
                 self.save_processed_files()
-                
+
                 processing_time = time.time() - start_time
-                logger.info(f"Processing completed successfully in {processing_time:.2f}s")
-                
+                logger.info(
+                    f"Processing completed successfully in {processing_time:.2f}s - {chunk_count} chunks"
+                )
+
                 if progress_callback:
                     progress_callback(1.0, "Processing completed!")
-                
+
                 return True
-                
+
         except Exception as e:
             logger.error(f"Processing failed: {e}")
             return False

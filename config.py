@@ -16,6 +16,7 @@ class EmbeddingConfig:
     max_retries: int = 3
     retry_delay: float = 1.0
     retry_backoff: float = 2.0
+    fallback_dimension: int = 384
 
 @dataclass
 class OCRConfig:
