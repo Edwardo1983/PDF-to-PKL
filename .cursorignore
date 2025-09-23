@@ -4,4 +4,4 @@ materiale_didactice/**
 !materiale_didactice/Scoala_de_Muzica_George_Enescu/clasa_2/Dezvoltare_personala/Prof_Carl_Jung/A971.pdf
 .venv/**
 __pycache__/**
-'@ | Set-Content -Encoding UTF8 .cursorignore
+
