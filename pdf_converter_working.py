@@ -894,7 +894,32 @@ class PDFEmbeddingsConverter:
     def process_pdf(self, pdf_path: str, progress_callback=None) -> bool:
         """Procesează PDF cu toate optimizările, progress tracking și resume capability"""
         start_time = time.time()
-        file_hash = self.get_file_hash(pdf_path)
+
+        if not pdf_path:
+            logger.error('PDF path is required for processing')
+            if progress_callback:
+                progress_callback(0.0, 'PDF path is missing')
+            return False
+
+        if not os.path.exists(pdf_path):
+            logger.error(f'File not found: {pdf_path}')
+            if progress_callback:
+                progress_callback(0.0, 'PDF file not found')
+            return False
+
+        if not os.path.isfile(pdf_path):
+            logger.error(f'Provided path is not a file: {pdf_path}')
+            if progress_callback:
+                progress_callback(0.0, 'Invalid PDF path')
+            return False
+
+        try:
+            file_hash = self.get_file_hash(pdf_path)
+        except (OSError, IOError) as exc:
+            logger.error(f'Failed to read PDF for hashing: {exc}')
+            if progress_callback:
+                progress_callback(0.0, 'Unable to read PDF contents')
+            return False
 
         # Verifică dacă e deja procesat
         if pdf_path in self.processed_files and self.processed_files[pdf_path] == file_hash:
