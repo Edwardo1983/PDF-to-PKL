@@ -1,0 +1,1185 @@
+import os
+import json
+import hashlib
+import time
+import re
+import threading
+import gc
+import logging
+import contextlib
+import psutil
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from config import (
+    EMBEDDING_CONFIG, DB_CONFIG, EDUCATIONAL_KEYWORDS, 
+    OCR_CONFIG, PROCESSING_CONFIG, LOGGING_CONFIG
+)
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional, Callable
+import PyPDF2
+import pdfplumber
+import fitz  # PyMuPDF
+import pytesseract
+from pdf2image import convert_from_path
+from PIL import Image
+import torch
+from sentence_transformers import SentenceTransformer
+import chromadb
+from chromadb.config import Settings
+from tqdm import tqdm
+import numpy as np
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# OCR imports pentru PDF-uri dificile (imagini, scanări)
+try:
+    import pytesseract
+    from pdf2image import convert_from_path
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+# Instrucțiunea pentru BGE/GTE în modul retrieval
+RETRIEVAL_INSTRUCTION = "Represent this sentence for retrieval: "
+
+# Data classes pentru monitoring
+@dataclass
+class ProcessingStats:
+    """Statistici pentru procesarea PDF-urilor"""
+    total_files: int = 0
+    successful: int = 0
+    failed: int = 0
+    skipped: int = 0
+    total_chunks: int = 0
+    total_processing_time: float = 0.0
+    memory_peak: float = 0.0
+    disk_usage_mb: float = 0.0
+
+@dataclass
+class ProcessingResult:
+    """Rezultatul procesării unui PDF"""
+    file_path: str
+    success: bool
+    chunks_created: int = 0
+    processing_time: float = 0.0
+    error_message: str = ""
+    memory_used_mb: float = 0.0
+
+# Setup logging structurat cu configurare dinamică
+logging.basicConfig(
+    level=getattr(logging, LOGGING_CONFIG.level.upper()),
+    format=LOGGING_CONFIG.format,
+    handlers=[
+        logging.FileHandler(LOGGING_CONFIG.log_file),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Context manager pentru memory management
+@contextmanager
+def memory_managed_processing():
+    """Context manager pentru gestionarea memoriei în timpul procesării"""
+    initial_memory = psutil.virtual_memory().percent
+    logger.info(f"Memory management started - Initial: {initial_memory:.1f}%")
+    
+    try:
+        yield
+    finally:
+        # Cleanup agresiv
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        final_memory = psutil.virtual_memory().percent
+        logger.info(f"Memory management completed - Final: {final_memory:.1f}% (Δ: {final_memory-initial_memory:+.1f}%)")
+
+# Context manager pentru retry logic
+@contextmanager
+def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
+    """Context manager pentru retry logic cu exponential backoff"""
+    for attempt in range(max_retries):
+        try:
+            yield attempt
+            return
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Final attempt failed after {max_retries} retries: {e}")
+                raise
+            else:
+                wait_time = delay * (backoff ** attempt)
+                logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {wait_time:.1f}s...")
+                time.sleep(wait_time)
+
+class PDFEmbeddingsConverter:
+    def __init__(self, embeddings_db_path: str = "./embeddings_db"):
+        logger.info("Initializing optimized PDF converter...")
+        
+        self.embeddings_db_path = embeddings_db_path
+        self.processed_files_path = os.path.join(embeddings_db_path, "processed_files.json")
+        self._file_lock = threading.Lock()  # Lock pentru thread safety la processed_files.json
+        
+        # Health checks la startup
+        self._validate_environment()
+        self._check_disk_space()
+        
+        os.makedirs(embeddings_db_path, exist_ok=True)
+        
+        # Setari conservative pentru Intel 12 cores
+        torch.set_num_threads(4)
+        os.environ['OMP_NUM_THREADS'] = '4'
+        os.environ['MKL_NUM_THREADS'] = '4'
+        
+        logger.info(f"Loading {EMBEDDING_CONFIG.model} model...")
+        with memory_managed_processing():
+            self.model = SentenceTransformer(EMBEDDING_CONFIG.model)
+        
+        logger.info("Initializing ChromaDB with cosine metric...")
+        with retry_on_failure(max_retries=3):
+            self.client = chromadb.PersistentClient(path=embeddings_db_path)
+
+        self.setup_ocr_tools()
+        self.processed_files = self.load_processed_files()
+        
+        # Initialize monitoring
+        self.processing_stats = ProcessingStats()
+        self._monitoring_enabled = True
+        
+        logger.info("Testing model functionality...")
+        if self.test_model():
+            logger.info("✅ Optimized converter is functional!")
+        else:
+            logger.error("❌ Potential model issues detected")
+    
+    def _validate_environment(self):
+        """Validează mediul de lucru și dependențele"""
+        logger.info("Validating environment...")
+        
+        # Verifică Python version
+        import sys
+        if sys.version_info < (3, 8):
+            raise RuntimeError("Python 3.8+ required")
+        
+        # Verifică memoria disponibilă
+        memory = psutil.virtual_memory()
+        if memory.available < 2 * 1024**3:  # 2GB
+            logger.warning(f"Low memory available: {memory.available / 1024**3:.1f}GB")
+        
+        # Verifică spațiul disk
+        disk = psutil.disk_usage('.')
+        if disk.free < PROCESSING_CONFIG.disk_space_threshold_gb * 1024**3:
+            logger.warning(f"Low disk space: {disk.free / 1024**3:.1f}GB (threshold: {PROCESSING_CONFIG.disk_space_threshold_gb}GB)")
+        
+        logger.info("Environment validation completed")
+    
+    def _check_disk_space(self):
+        """Verifică spațiul disk disponibil"""
+        try:
+            disk = psutil.disk_usage(self.embeddings_db_path)
+            free_gb = disk.free / (1024**3)
+            
+            if free_gb < PROCESSING_CONFIG.disk_space_threshold_gb:
+                raise RuntimeError(f"Insufficient disk space: {free_gb:.1f}GB available (threshold: {PROCESSING_CONFIG.disk_space_threshold_gb}GB)")
+            
+            logger.info(f"Disk space check: {free_gb:.1f}GB available")
+        except Exception as e:
+            logger.error(f"Disk space check failed: {e}")
+            raise
+    
+    def setup_ocr_tools(self):
+        """Configurează instrumentele OCR pentru PDF-uri dificile"""
+        self.ocr_available = OCR_AVAILABLE
+        self.tesseract_available = False
+        self.poppler_available = False
+        
+        if not OCR_AVAILABLE:
+            print("⚠️ OCR nu este disponibil - instalați: pip install pytesseract pdf2image Pillow")
+            return
+            
+        # Configurează paths pentru Tesseract și Poppler
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        tesseract_path = os.path.join(current_dir, "install", "Tesseract-OCR", "tesseract.exe")
+        poppler_path = os.path.join(current_dir, "install", "poppler-25.07.0", "Library", "bin")
+        
+        # Verifică Tesseract
+        if os.path.exists(tesseract_path):
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+            self.tesseract_available = True
+            print(f"✅ Tesseract găsit: {tesseract_path}")
+        else:
+            print(f"❌ Tesseract nu a fost găsit la: {tesseract_path}")
+        
+        # Configurează Poppler path
+        if os.path.exists(poppler_path):
+            self.poppler_path = poppler_path
+            self.poppler_available = True
+            print(f"✅ Poppler găsit: {poppler_path}")
+        else:
+            self.poppler_path = None
+            print(f"❌ Poppler nu a fost găsit la: {poppler_path}")
+        
+        # Status final OCR
+        if self.tesseract_available and self.poppler_available:
+            print("🎯 OCR complet funcțional - va putea procesa toate PDF-urile!")
+        else:
+            print("⚠️ OCR incomplet - unele PDF-uri dificile s-ar putea să nu fie procesate")
+    
+    def test_model(self):
+        try:
+            start_time = time.time()
+            # Test cu instructiunea de retrieval si normalizare
+            embedding = self.model.encode(
+                [RETRIEVAL_INSTRUCTION + "Test simplu pentru verificare"],
+                normalize_embeddings=True
+            )
+            duration = time.time() - start_time
+            print(f"Test embedding optimizat: {embedding.shape}, timp: {duration:.2f}s")
+            
+            # Estimare pentru 162 chunks
+            estimated_total = duration * 162
+            print(f"Estimare pentru 162 chunks: {estimated_total/60:.1f} minute")
+            return True
+        except Exception as e:
+            print(f"Eroare test: {e}")
+            return False
+
+    def get_optimal_batch_size(self, chunk_count: int) -> int:
+        """Calculează batch size optim bazat pe memoria disponibilă și numărul de chunks"""
+        try:
+            memory_percent = psutil.virtual_memory().percent
+            available_gb = psutil.virtual_memory().available / (1024**3)
+            cpu_count = psutil.cpu_count()
+            
+            # Logică îmbunătățită pentru batch sizing
+            base_batch = 16
+            
+            # Ajustare bazată pe memorie
+            if memory_percent > 85:
+                base_batch = 4   # Foarte conservativ
+            elif memory_percent > 75:
+                base_batch = 8   # Conservativ
+            elif memory_percent > 60:
+                base_batch = 16  # Normal
+            else:
+                base_batch = 32  # Agresiv
+            
+            # Ajustare bazată pe numărul de chunks
+            if chunk_count > 1000:
+                base_batch = min(base_batch, 16)  # Pentru fișiere foarte mari
+            elif chunk_count > 500:
+                base_batch = min(base_batch, 24)  # Pentru fișiere mari
+            
+            # Ajustare bazată pe CPU cores
+            base_batch = min(base_batch, cpu_count * 4)
+            
+            # Ajustare bazată pe RAM disponibil
+            if available_gb < 1:
+                base_batch = 4
+            elif available_gb < 2:
+                base_batch = min(base_batch, 8)
+            
+            logger.info(f"Optimal batch size: {base_batch} (memory: {memory_percent:.1f}%, chunks: {chunk_count}, RAM: {available_gb:.1f}GB)")
+            return max(1, base_batch)  # Minimum 1
+            
+        except Exception as e:
+            logger.error(f"Error calculating batch size: {e}")
+            return 8  # Fallback conservativ
+
+    def extract_text_with_ocr(self, pdf_path: str, max_pages: int = None) -> str:
+        """Extrage text din PDF folosind OCR pentru PDF-uri scanate sau cu imagini"""
+        if not self.ocr_available or not self.tesseract_available or not self.poppler_available:
+            logger.error("OCR not fully available")
+            return ""
+        
+        with memory_managed_processing():
+            with retry_on_failure(max_retries=2, delay=2.0):
+                try:
+                    logger.info(f"Processing with OCR: {os.path.basename(pdf_path)}")
+                    
+                    # Convertește PDF în imagini cu retry
+                    images = convert_from_path(
+                        pdf_path,
+                        dpi=OCR_CONFIG.dpi,
+                        poppler_path=self.poppler_path,
+                        first_page=1,
+                        last_page=max_pages if max_pages else OCR_CONFIG.max_pages_ocr
+                    )
+                    
+                    logger.info(f"Converted to {len(images)} images")
+                    
+                    if not images:
+                        return ""
+                    
+                    extracted_text = []
+                    
+                    # Procesează fiecare pagină cu OCR și memory management
+                    for i, image in enumerate(tqdm(images, desc="OCR pages")):
+                        try:
+                            with memory_managed_processing():
+                                # Optimizare imagine pentru OCR
+                                if image.mode != 'RGB':
+                                    image = image.convert('RGB')
+                                
+                                # OCR cu limba română și retry
+                                with retry_on_failure(max_retries=OCR_CONFIG.max_retries, delay=OCR_CONFIG.retry_delay):
+                                    page_text = pytesseract.image_to_string(
+                                        image, 
+                                        lang=OCR_CONFIG.languages,
+                                        config=OCR_CONFIG.tesseract_config
+                                    )
+                                
+                                if page_text.strip():
+                                    extracted_text.append(f"\n--- Page {i+1} ---\n{page_text.strip()}")
+                                
+                                # Cleanup agresiv pentru fiecare imagine
+                                del image
+                                
+                        except Exception as e:
+                            logger.warning(f"OCR error on page {i+1}: {e}")
+                            continue
+                        
+                        # Cleanup la fiecare 3 pagini pentru a preveni memory leaks
+                        if i % 3 == 0:
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                    
+                    final_text = "\n".join(extracted_text)
+                    logger.info(f"OCR completed: {len(final_text)} characters from {len(images)} pages")
+                    
+                    return final_text
+                    
+                except Exception as e:
+                    logger.error(f"General OCR error: {e}")
+                    return ""
+    
+    def is_pdf_text_extractable(self, pdf_path: str) -> Tuple[bool, str]:
+        """Verifică dacă PDF-ul conține text extractabil și returnează motivul"""
+        try:
+            # Test rapid cu PyMuPDF
+            doc = fitz.open(pdf_path)
+            total_chars = 0
+            pages_checked = min(3, len(doc))
+            
+            for page_num in range(pages_checked):
+                page = doc.load_page(page_num)
+                page_text = page.get_text()
+                total_chars += len(page_text.strip())
+            
+            doc.close()
+            
+            chars_per_page = total_chars / pages_checked if pages_checked > 0 else 0
+            
+            if chars_per_page < 50:
+                return False, f"PDF scanat/imagini (doar {chars_per_page:.1f} chars/pagină)"
+            else:
+                return True, f"Text extractabil ({chars_per_page:.1f} chars/pagină)"
+                
+        except Exception as e:
+            return False, f"Eroare verificare: {e}"
+        try:
+            start_time = time.time()
+            # Test cu instrucțiunea de retrieval și normalizare
+            embedding = self.model.encode(
+                [RETRIEVAL_INSTRUCTION + "Test simplu pentru verificare"],
+                normalize_embeddings=True
+            )
+            duration = time.time() - start_time
+            print(f"Test embedding optimizat: {embedding.shape}, timp: {duration:.2f}s")
+            
+            # Estimare pentru 162 chunks
+            estimated_total = duration * 162
+            print(f"Estimare pentru 162 chunks: {estimated_total/60:.1f} minute")
+            return True
+        except Exception as e:
+            print(f"Eroare test: {e}")
+            return False
+    
+    def extract_text_with_pages(self, pdf_path: str) -> Tuple[str, List[Tuple[str, int]]]:
+        """Extrage text cu informații despre pagini - cu fallback OCR pentru PDF-uri dificile"""
+        print(f"Procesez cu metode multiple: {os.path.basename(pdf_path)}")
+        
+        # Verifică dacă PDF-ul are text extractabil
+        is_extractable, reason = self.is_pdf_text_extractable(pdf_path)
+        print(f"📋 Analiza PDF: {reason}")
+        
+        # Metodă 1: PyMuPDF (cea mai rapidă)
+        if is_extractable:
+            try:
+                print("🔄 Metoda 1: PyMuPDF...")
+                text_pages = []
+                doc = fitz.open(pdf_path)
+                for page_num in range(len(doc)):
+                    page = doc.load_page(page_num)
+                    page_text = page.get_text()
+                    if page_text:
+                        text_pages.append((page_text, page_num + 1))
+                doc.close()
+                
+                if text_pages:
+                    full_text = "\n".join([text for text, _ in text_pages])
+                    print(f"✅ PyMuPDF succes: {len(full_text)} caractere din {len(text_pages)} pagini")
+                    return full_text.strip(), text_pages
+                else:
+                    print("⚠️ PyMuPDF: Nu s-a extras text")
+            except Exception as e:
+                print(f"⚠️ PyMuPDF eroare: {e}")
+        
+        # Metodă 2: pdfplumber (backup pentru PDF-uri complexe)
+        if is_extractable:
+            try:
+                print("🔄 Metoda 2: pdfplumber...")
+                text = ""
+                with pdfplumber.open(pdf_path) as pdf:
+                    for page_num, page in enumerate(pdf.pages):
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n"
+                
+                if text.strip():
+                    print(f"✅ pdfplumber succes: {len(text)} caractere")
+                    estimated_pages = [(text, 1)]  # Simplificat pentru pdfplumber
+                    return text.strip(), estimated_pages
+                else:
+                    print("⚠️ pdfplumber: Nu s-a extras text")
+            except Exception as e:
+                print(f"⚠️ pdfplumber eroare: {e}")
+        
+        # Metodă 3: PyPDF2 (ultimă încercare pentru text)
+        if is_extractable:
+            try:
+                print("🔄 Metoda 3: PyPDF2...")
+                text = ""
+                with open(pdf_path, 'rb') as file:
+                    pdf_reader = PyPDF2.PdfReader(file)
+                    for page_num, page in enumerate(pdf_reader.pages):
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n"
+                
+                if text.strip():
+                    print(f"✅ PyPDF2 succes: {len(text)} caractere")
+                    estimated_pages = [(text, 1)]
+                    return text.strip(), estimated_pages
+                else:
+                    print("⚠️ PyPDF2: Nu s-a extras text")
+            except Exception as e:
+                print(f"⚠️ PyPDF2 eroare: {e}")
+        
+        # Metodă 4: OCR (pentru PDF-uri scanate sau cu imagini)
+        if self.ocr_available and self.tesseract_available and self.poppler_available:
+            try:
+                print("🔄 Metoda 4: OCR (Tesseract)...")
+                # Limitează la primele 50 de pagini pentru OCR (pentru a evita timpii foarte lungi)
+                ocr_text = self.extract_text_with_ocr(pdf_path, max_pages=50)
+                
+                if ocr_text.strip():
+                    print(f"✅ OCR succes: {len(ocr_text)} caractere")
+                    ocr_pages = [(ocr_text, 1)]  # Simplificat pentru OCR
+                    return ocr_text.strip(), ocr_pages
+                else:
+                    print("⚠️ OCR: Nu s-a extras text")
+            except Exception as e:
+                print(f"⚠️ OCR eroare: {e}")
+        else:
+            print("⚠️ OCR nu este disponibil pentru PDF-uri dificile")
+        
+        print("❌ Toate metodele au eșuat - nu s-a putut extrage text")
+        return "", []
+    
+    def advanced_chunk_text(self, text: str, text_pages: List[Tuple[str, int]], 
+                       chunk_size: int = None, overlap: int = None) -> Tuple[List[str], List[Dict]]:
+        """Chunking îmbunătățit cu LangChain pentru conținut educațional"""
+        
+        # Folosește configurația dinamică dacă nu sunt specificate parametrii
+        if chunk_size is None:
+            chunk_size = EMBEDDING_CONFIG.chunk_size
+        if overlap is None:
+            overlap = EMBEDDING_CONFIG.overlap
+        
+        # Folosește LangChain pentru chunking mai inteligent
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=overlap,
+            separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""],
+            keep_separator=True
+        )
+        
+        chunks = splitter.split_text(text)
+        
+        # Filtrează chunk-urile prea scurte
+        meaningful_chunks = [chunk for chunk in chunks if len(chunk.split()) >= 10]
+        
+        # Generează metadata simplificată pentru LangChain chunks
+        chunk_metadata = []
+        for i, chunk in enumerate(meaningful_chunks):
+            # Estimează pagina bazată pe poziția în text
+            char_position = text.find(chunk)
+            estimated_page = 1
+            if text_pages and char_position != -1:
+                cumulative_chars = 0
+                for page_text, page_num in text_pages:
+                    if cumulative_chars + len(page_text) > char_position:
+                        estimated_page = page_num
+                        break
+                    cumulative_chars += len(page_text)
+            
+            chunk_metadata.append({
+                "page_from": estimated_page,
+                "page_to": estimated_page,
+                "sentence_count": len([s for s in chunk.split('.') if s.strip()]),
+                "word_count": len(chunk.split())
+            })
+        
+        print(f"LangChain chunking: {len(meaningful_chunks)} bucăți create")
+        return meaningful_chunks, chunk_metadata
+    
+    def generate_embeddings_streaming(self, chunks: List[str]) -> np.ndarray:
+        """Generează embeddings cu streaming și dynamic batch sizing pentru optimizare memorie"""
+        logger.info(f"Generating embeddings for {len(chunks)} chunks...")
+        
+        # Calculează batch size optim dinamic
+        optimal_batch_size = self.get_optimal_batch_size(len(chunks))
+        logger.info(f"Using dynamic batch size: {optimal_batch_size}")
+        
+        all_embeddings = []
+        successful = 0
+        failed = 0
+        
+        with memory_managed_processing():
+            for i in range(0, len(chunks), optimal_batch_size):
+                batch_end = min(i + optimal_batch_size, len(chunks))
+                batch_chunks = chunks[i:batch_end]
+                
+                try:
+                    batch_num = i//optimal_batch_size + 1
+                    total_batches = (len(chunks) + optimal_batch_size - 1)//optimal_batch_size
+                    
+                    logger.info(f"Processing batch {batch_num}/{total_batches}: chunks {i+1}-{batch_end}/{len(chunks)}")
+                    
+                    with retry_on_failure(max_retries=3, delay=1.0):
+                        # Adaugă instrucțiunea de retrieval și normalizează
+                        prefixed_chunks = [RETRIEVAL_INSTRUCTION + chunk for chunk in batch_chunks]
+                        batch_embeddings = self.model.encode(
+                            prefixed_chunks,
+                            normalize_embeddings=True,
+                            show_progress_bar=False,
+                            convert_to_numpy=True
+                        )
+                        
+                        all_embeddings.append(batch_embeddings)
+                        successful += len(batch_chunks)
+                        
+                        # Cleanup memorie după fiecare batch
+                        del prefixed_chunks
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    
+                except Exception as e:
+                    logger.error(f"Batch {batch_num} failed: {e}")
+                    failed += len(batch_chunks)
+                    
+                    # Încearcă să proceseze chunk-urile individual
+                    logger.info(f"Attempting individual chunk processing for batch {batch_num}")
+                    individual_embeddings = []
+                    
+                    for chunk in batch_chunks:
+                        try:
+                            with retry_on_failure(max_retries=2, delay=0.5):
+                                individual_embedding = self.model.encode(
+                                    [RETRIEVAL_INSTRUCTION + chunk],
+                                    normalize_embeddings=True,
+                                    show_progress_bar=False,
+                                    convert_to_numpy=True
+                                )
+                                individual_embeddings.append(individual_embedding[0])
+                                successful += 1
+                                failed -= 1
+                        except Exception as individual_error:
+                            logger.warning(f"Individual chunk failed: {individual_error}")
+                            # Embedding dummy pentru consistency
+                            dummy_dim = self.model.get_sentence_embedding_dimension()
+                            individual_embeddings.append(np.zeros(dummy_dim))
+                    
+                    if individual_embeddings:
+                        all_embeddings.append(np.array(individual_embeddings))
+        
+        if all_embeddings:
+            final_embeddings = np.vstack(all_embeddings)
+            logger.info(f"Embeddings generation completed: {final_embeddings.shape} (successful: {successful}, failed: {failed})")
+            return final_embeddings
+        else:
+            logger.error("No embeddings generated")
+            return np.array([])
+    
+    def get_collection_name(self, file_path: str) -> str:
+        """Generează nume colecție consistente"""
+        path_parts = Path(file_path).parts
+        
+        if "materiale_didactice" in path_parts:
+            idx = path_parts.index("materiale_didactice")
+            relevant_parts = path_parts[idx+1:]
+        else:
+            relevant_parts = path_parts[:-1]
+        
+        clean_parts = []
+        for part in relevant_parts:
+            clean_part = part.replace(" ", "_").replace("-", "_").lower()
+            clean_parts.append(clean_part)
+        
+        collection_name = "_".join(clean_parts)
+        collection_name = "".join(c for c in collection_name if c.isalnum() or c == "_")
+        
+        if len(collection_name) > 60:  # Păstrează 3 caractere pentru siguranță
+        # Scurtează inteligent
+            parts = collection_name.split("_")
+            short_name = "_".join(parts[:3])  # Păstrează primele 3 părți
+            if len(short_name) > 60:
+                short_name = short_name[:60]
+            collection_name = short_name
+
+        return collection_name or "general"
+    
+    def get_file_hash(self, file_path: str) -> str:
+        """Calculează hash MD5 pentru detectarea modificărilor"""
+        hasher = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    
+    def load_processed_files(self) -> Dict[str, str]:
+        """Încarcă registry-ul fișierelor procesate cu thread safety"""
+        with self._file_lock:
+            if os.path.exists(self.processed_files_path):
+                try:
+                    with open(self.processed_files_path, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                except (json.JSONDecodeError, IOError) as e:
+                    print(f"Eroare citire processed_files.json: {e}. Creez registry nou.")
+                    return {}
+            return {}
+    
+    def save_processed_files_unsafe(self):
+        """Salvează fără lock - pentru uz intern când lock-ul e deja achiziționat"""
+        try:
+            # Scriere atomică prin temp file
+            temp_path = self.processed_files_path + '.tmp'
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(self.processed_files, f, ensure_ascii=False, indent=2)
+            
+            # Rename atomic (pe majoritatea sistemelor)
+            if os.name == 'nt':  # Windows
+                if os.path.exists(self.processed_files_path):
+                    os.remove(self.processed_files_path)
+                os.rename(temp_path, self.processed_files_path)
+            else:  # Unix-like
+                os.rename(temp_path, self.processed_files_path)
+                
+        except (IOError, OSError) as e:
+            print(f"Eroare salvare processed_files.json: {e}")
+            # Cleanup temp file dacă există
+            temp_path = self.processed_files_path + '.tmp'
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+    
+    def save_processed_files(self):
+        """Salvează registry-ul fișierelor procesate cu thread safety"""
+        with self._file_lock:
+            self.save_processed_files_unsafe()
+    
+    def generate_stable_id(self, file_path: str, chunk_index: int, file_hash: str) -> str:
+        """Generează ID-uri stabile pentru evitarea coliziunilor"""
+        collection_name = self.get_collection_name(file_path)
+        return f"{collection_name}_{file_hash[:8]}_{chunk_index}"
+    
+    def process_pdf(self, pdf_path: str, progress_callback=None) -> bool:
+        """Procesează PDF cu toate optimizările, progress tracking și resume capability"""
+        start_time = time.time()
+        file_hash = self.get_file_hash(pdf_path)
+        
+        # Verifică dacă e deja procesat
+        if pdf_path in self.processed_files and self.processed_files[pdf_path] == file_hash:
+            logger.info(f"File already processed - skipping: {os.path.basename(pdf_path)}")
+            return True
+        
+        logger.info(f"Processing optimized: {os.path.basename(pdf_path)}")
+        
+        try:
+            with memory_managed_processing():
+                # Step 1: Extract text with progress tracking
+                if progress_callback:
+                    progress_callback(0.1, "Extracting text from PDF...")
+                
+                text, text_pages = self.extract_text_with_pages(pdf_path)
+                if not text:
+                    logger.error("Could not extract text from PDF")
+                    return False
+                
+                logger.info(f"Text extracted: {len(text)} characters from {len(text_pages)} pages")
+                
+                # Step 2: Advanced chunking
+                if progress_callback:
+                    progress_callback(0.3, "Creating text chunks...")
+                
+                chunks, chunk_metadata = self.advanced_chunk_text(text, text_pages)
+                if not chunks:
+                    logger.error("Could not create chunks")
+                    return False
+                
+                logger.info(f"Created {len(chunks)} chunks")
+                
+                # Step 3: Generate embeddings with progress tracking
+                if progress_callback:
+                    progress_callback(0.5, "Generating embeddings...")
+                
+                embeddings = self.generate_embeddings_streaming(chunks)
+                if embeddings.size == 0:
+                    logger.error("Could not generate embeddings")
+                    return False
+                
+                logger.info(f"Generated embeddings: {embeddings.shape}")
+                
+                # Step 4: Save to ChromaDB with retry logic
+                if progress_callback:
+                    progress_callback(0.8, "Saving to database...")
+                
+                collection_name = self.get_collection_name(pdf_path)
+                logger.info(f"Saving to optimized collection: {collection_name}")
+                
+                with retry_on_failure(max_retries=3, delay=2.0):
+                    collection = self.client.get_or_create_collection(
+                        name=collection_name,
+                        metadata={
+                            "hnsw:space": "cosine",  # Forțează metrică cosine
+                            "description": f"Optimized embeddings for {pdf_path}",
+                            "created_at": datetime.now().isoformat(),
+                            "chunk_count": len(chunks),
+                            "model": EMBEDDING_CONFIG.model,
+                            "retrieval_instruction": True,
+                            "normalized": True,
+                            "file_hash": file_hash
+                        }
+                    )
+                    
+                    # Construiește metadate complete
+                    metadatas = []
+                    for i, chunk_meta in enumerate(chunk_metadata):
+                        metadata = {
+                            "source_file": pdf_path,
+                            "chunk_index": i,
+                            "processed_at": datetime.now().isoformat(),
+                            "page_from": chunk_meta["page_from"],
+                            "page_to": chunk_meta["page_to"],
+                            "sentence_count": chunk_meta["sentence_count"],
+                            "word_count": chunk_meta["word_count"],
+                            "file_hash": file_hash
+                        }
+                        metadatas.append(metadata)
+                    
+                    # Generează ID-uri stabile
+                    ids = [self.generate_stable_id(pdf_path, i, file_hash) for i in range(len(chunks))]
+                    
+                    # Salvează în batch-uri cu dynamic batch sizing
+                    optimal_batch_size = min(DB_CONFIG.batch_size, self.get_optimal_batch_size(len(chunks)))
+                    for i in range(0, len(chunks), optimal_batch_size):
+                        end_idx = min(i + optimal_batch_size, len(chunks))
+                        
+                        with retry_on_failure(max_retries=2, delay=1.0):
+                            collection.add(
+                                embeddings=embeddings[i:end_idx].tolist(),
+                                documents=chunks[i:end_idx],
+                                metadatas=metadatas[i:end_idx],
+                                ids=ids[i:end_idx]
+                            )
+                    
+                    logger.info(f"Saved {len(chunks)} chunks to ChromaDB")
+                
+                # Step 5: Mark as processed
+                if progress_callback:
+                    progress_callback(0.95, "Finalizing...")
+                
+                self.processed_files[pdf_path] = file_hash
+                self.save_processed_files()
+                
+                processing_time = time.time() - start_time
+                logger.info(f"Processing completed successfully in {processing_time:.2f}s")
+                
+                if progress_callback:
+                    progress_callback(1.0, "Processing completed!")
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Processing failed: {e}")
+            return False
+    
+    def process_pdfs_parallel(self, pdf_paths: List[str], max_workers: int = None, 
+                            progress_callback: Callable = None) -> List[ProcessingResult]:
+        """Procesează multiple PDF-uri în paralel cu monitoring"""
+        if max_workers is None:
+            max_workers = min(PROCESSING_CONFIG.max_workers, psutil.cpu_count())
+        
+        logger.info(f"Starting parallel processing of {len(pdf_paths)} PDFs with {max_workers} workers")
+        
+        results = []
+        start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_path = {
+                executor.submit(self._process_single_pdf_with_monitoring, pdf_path): pdf_path 
+                for pdf_path in pdf_paths
+            }
+            
+            # Process completed tasks with progress tracking
+            with tqdm(total=len(pdf_paths), desc="Processing PDFs") as pbar:
+                for future in as_completed(future_to_path):
+                    pdf_path = future_to_path[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                        
+                        # Update stats
+                        self.processing_stats.total_files += 1
+                        if result.success:
+                            self.processing_stats.successful += 1
+                            self.processing_stats.total_chunks += result.chunks_created
+                        else:
+                            self.processing_stats.failed += 1
+                        
+                        self.processing_stats.total_processing_time += result.processing_time
+                        self.processing_stats.memory_peak = max(
+                            self.processing_stats.memory_peak, 
+                            result.memory_used_mb
+                        )
+                        
+                        # Progress callback
+                        if progress_callback:
+                            progress = len(results) / len(pdf_paths)
+                            progress_callback(progress, f"Processed {len(results)}/{len(pdf_paths)} files")
+                        
+                        pbar.update(1)
+                        pbar.set_postfix({
+                            'Success': self.processing_stats.successful,
+                            'Failed': self.processing_stats.failed,
+                            'Success Rate': f"{self.processing_stats.successful/self.processing_stats.total_files*100:.1f}%"
+                        })
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing {pdf_path}: {e}")
+                        results.append(ProcessingResult(
+                            file_path=pdf_path,
+                            success=False,
+                            error_message=str(e)
+                        ))
+                        self.processing_stats.failed += 1
+                        pbar.update(1)
+        
+        total_time = time.time() - start_time
+        logger.info(f"Parallel processing completed in {total_time:.2f}s")
+        logger.info(f"Results: {self.processing_stats.successful} successful, {self.processing_stats.failed} failed")
+        
+        return results
+    
+    def _process_single_pdf_with_monitoring(self, pdf_path: str) -> ProcessingResult:
+        """Procesează un singur PDF cu monitoring detaliat"""
+        start_time = time.time()
+        initial_memory = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        
+        try:
+            # Verifică dacă e deja procesat
+            file_hash = self.get_file_hash(pdf_path)
+            if pdf_path in self.processed_files and self.processed_files[pdf_path] == file_hash:
+                return ProcessingResult(
+                    file_path=pdf_path,
+                    success=True,
+                    processing_time=time.time() - start_time,
+                    memory_used_mb=0
+                )
+            
+            # Procesează cu monitoring
+            success = self.process_pdf(pdf_path)
+            
+            processing_time = time.time() - start_time
+            final_memory = psutil.Process().memory_info().rss / 1024 / 1024
+            memory_used = final_memory - initial_memory
+            
+            # Estimează numărul de chunks (simplificat)
+            chunks_created = 0
+            if success:
+                try:
+                    collection_name = self.get_collection_name(pdf_path)
+                    collection = self.client.get_collection(collection_name)
+                    chunks_created = collection.count()
+                except:
+                    chunks_created = 0
+            
+            return ProcessingResult(
+                file_path=pdf_path,
+                success=success,
+                chunks_created=chunks_created,
+                processing_time=processing_time,
+                memory_used_mb=memory_used
+            )
+            
+        except Exception as e:
+            return ProcessingResult(
+                file_path=pdf_path,
+                success=False,
+                processing_time=time.time() - start_time,
+                error_message=str(e),
+                memory_used_mb=psutil.Process().memory_info().rss / 1024 / 1024 - initial_memory
+            )
+    
+    def get_processing_stats(self) -> ProcessingStats:
+        """Returnează statisticile de procesare"""
+        # Update disk usage
+        try:
+            embeddings_size = sum(
+                f.stat().st_size for f in Path(self.embeddings_db_path).rglob('*') if f.is_file()
+            )
+            self.processing_stats.disk_usage_mb = embeddings_size / (1024**2)
+        except:
+            pass
+        
+        return self.processing_stats
+    
+    def reset_processing_stats(self):
+        """Resetează statisticile de procesare"""
+        self.processing_stats = ProcessingStats()
+        logger.info("Processing statistics reset")
+    
+    def enhanced_search_educational(self, query: str, top_k: int = 5, collection_name: str = None):
+        """Căutare îmbunătățită cu scoring special pentru conținut educațional"""
+        
+        # Căutare inițială cu mai multe rezultate
+        initial_results = self.search_similar(query, top_k=top_k*2, collection_name=collection_name)
+        
+        if not initial_results or not initial_results.get('documents') or not initial_results['documents'][0]:
+            return initial_results
+        
+        docs = initial_results['documents'][0]
+        metadatas = initial_results.get('metadatas', [[]])[0] or [{} for _ in docs]
+        similarities = initial_results.get('similarities', [[]])[0] or [0.0 for _ in docs]
+        collections = initial_results.get('collections', [[]])[0] or ["unknown" for _ in docs]
+        
+        # Re-scoring cu boost pentru termeni educaționali
+        enhanced_items = []
+        
+        for doc, meta, sim, col in zip(docs, metadatas, similarities, collections):
+            # Scor de bază
+            score = sim
+            
+            # Boost pentru termeni educaționali
+            educational_boost = 0
+            doc_lower = doc.lower()
+            query_lower = query.lower()
+            
+            for keyword in EDUCATIONAL_KEYWORDS:
+                if keyword in doc_lower:
+                    educational_boost += 0.05
+                if keyword in query_lower and keyword in doc_lower:
+                    educational_boost += 0.1
+            
+            # Boost pentru coincidențe exacte de cuvinte
+            query_words = set(query_lower.split())
+            doc_words = set(doc_lower.split())
+            word_overlap = len(query_words & doc_words)
+            if word_overlap > 0:
+                educational_boost += word_overlap * 0.02
+            
+            # Scor final
+            final_score = min(score + educational_boost, 1.0)
+            
+            enhanced_items.append({
+                "document": doc,
+                "metadata": meta,
+                "similarity": final_score,
+                "collection": col,
+                "original_score": sim,
+                "educational_boost": educational_boost
+            })
+        
+        # Sortare după scorul îmbunătățit
+        enhanced_items.sort(key=lambda x: x["similarity"], reverse=True)
+        top_items = enhanced_items[:top_k]
+        
+        # Format compatibil cu sistemul existent
+        return {
+            "documents": [[item["document"] for item in top_items]],
+            "metadatas": [[item["metadata"] for item in top_items]],
+            "similarities": [[item["similarity"] for item in top_items]],
+            "collections": [[item["collection"] for item in top_items]]
+        }
+
+    def search_similar(self, query: str, top_k: int = 5, collection_name: str = None):
+        """Căutare optimizată cu sortare globală și scoruri"""
+        try:
+            # Encodează query cu instrucțiunea de retrieval și normalizare
+            query_embedding = self.model.encode(
+                [RETRIEVAL_INSTRUCTION + query],
+                normalize_embeddings=True
+            )
+            
+            collections_to_search = []
+            if collection_name:
+                try:
+                    collections_to_search = [self.client.get_collection(collection_name)]
+                except:
+                    print(f"Colecția {collection_name} nu există")
+                    return None
+            else:
+                collections_to_search = self.client.list_collections()
+            
+            # Colectează rezultate din toate colecțiile cu scoruri
+            all_items = []
+            
+            for collection in collections_to_search:
+                try:
+                    results = collection.query(
+                        query_embeddings=query_embedding.tolist(),
+                        n_results=min(top_k, 5)  # Ia mai puține din fiecare colecție
+                    )
+                    
+                    if results and results.get('documents') and results['documents'][0]:
+                        docs = results["documents"][0]
+                        metadatas = results.get("metadatas", [[]])[0] or [{} for _ in docs]
+                        distances = results.get("distances", [[]])[0] or [1.0 for _ in docs]
+                        
+                        # Pentru cosine similarity, convertește distanțele în similarități
+                        similarities = [1 - dist for dist in distances]
+                        
+                        for doc, meta, sim in zip(docs, metadatas, similarities):
+                            all_items.append({
+                                "document": doc,
+                                "metadata": meta,
+                                "similarity": sim,
+                                "collection": collection.name
+                            })
+                            
+                except Exception as e:
+                    print(f"Eroare căutare în {collection.name}: {e}")
+            
+            # Sortare globală după similaritate (descrescător)
+            all_items.sort(key=lambda x: x["similarity"], reverse=True)
+            
+            # Returnează top_k global cu format compatibil
+            top_items = all_items[:top_k]
+            
+            if top_items:
+                result = {
+                    "documents": [[item["document"] for item in top_items]],
+                    "metadatas": [[item["metadata"] for item in top_items]],
+                    "similarities": [[item["similarity"] for item in top_items]],
+                    "collections": [[item["collection"] for item in top_items]]
+                }
+                return result
+            else:
+                return {"documents": [[]], "metadatas": [[]], "similarities": [[]], "collections": [[]]}
+                
+        except Exception as e:
+            print(f"Eroare căutare optimizată: {e}")
+            return None
+    
+    def cleanup_resources(self):
+        """Cleanup manual pentru resurse, temp files și optimizare disk usage"""
+        try:
+            print("🧹 Cleanup resurse...")
+            
+            # Force garbage collection pentru Python
+            import gc
+            gc.collect()
+            
+            # Cleanup CUDA cache daca existe
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Cleanup temp files Windows specifice pentru OCR și PDF
+            import tempfile
+            temp_dir = tempfile.gettempdir()
+            temp_patterns = ['tmp', 'pdf2image', 'tesseract', 'chroma', 'sentence-transformers']
+            
+            cleaned_count = 0
+            for pattern in temp_patterns:
+                try:
+                    temp_files = Path(temp_dir).glob(f"*{pattern}*")
+                    for temp_file in temp_files:
+                        try:
+                            if temp_file.is_file():
+                                temp_file.unlink()
+                                cleaned_count += 1
+                            elif temp_file.is_dir():
+                                import shutil
+                                shutil.rmtree(temp_file, ignore_errors=True)
+                                cleaned_count += 1
+                        except (PermissionError, FileNotFoundError):
+                            continue  # Skip files in use
+                except Exception:
+                    continue
+            
+            if cleaned_count > 0:
+                print(f"🗑️ Șters {cleaned_count} fișiere temporare")
+                      # Reconnect ChromaDB fără stop forțat
+            try:
+                # Testează conexiunea și reconectează dacă e nevoie
+                test_collections = self.client.list_collections()
+                print(f"ChromaDB activ cu {len(test_collections)} colecții")
+            except Exception as e:
+                print(f"Reconectez ChromaDB după eroare: {e}")
+                self.client = chromadb.PersistentClient(path=self.embeddings_db_path)
+                
+                print("✅ Cleanup resurse completat")
+            
+        except Exception as e:
+            print(f"⚠️ Warning cleanup general: {e}")
+    
+    def get_disk_usage_stats(self):
+        """Returnează statistici despre utilizarea disk-ului"""
+        try:
+            import shutil
+            total, used, free = shutil.disk_usage(self.embeddings_db_path)
+            
+            # Calculează dimensiunea embeddings_db
+            embeddings_size = sum(
+                f.stat().st_size for f in Path(self.embeddings_db_path).rglob('*') if f.is_file()
+            )
+            
+            return {
+                "total_disk_gb": round(total / (1024**3), 2),
+                "used_disk_gb": round(used / (1024**3), 2), 
+                "free_disk_gb": round(free / (1024**3), 2),
+                "disk_usage_percent": round((used/total)*100, 1),
+                "embeddings_db_mb": round(embeddings_size / (1024**2), 2)
+            }
+        except Exception as e:
+            return {"error": str(e)}
+        
+    def list_collections(self):  
+        """Listează colecții cu informații detaliate"""
+        collections = self.client.list_collections()
+        print(f"Colecții disponibile ({len(collections)}):")
+        
+        for collection in collections:
+            try:
+                count = collection.count()
+                metadata = collection.metadata or {}
+                model = metadata.get("model", "necunoscut")
+                optimized = "✓" if metadata.get("retrieval_instruction") else "✗"
+                
+                print(f"  - {collection.name}: {count} documente")
+                print(f"    Model: {model}, Optimizat: {optimized}")
+                
+                if "created_at" in metadata:
+                    print(f"    Creat: {metadata['created_at'][:16]}")
+                    
+            except Exception as e:
+                print(f"  - {collection.name}: eroare - {e}")
+
+if __name__ == "__main__":
+    converter = PDFEmbeddingsConverter()

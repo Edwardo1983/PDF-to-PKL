@@ -5,18 +5,20 @@ __pycache__/
 *.pyo
 *.pyd
 .env
+*.log
 .DS_Store
 Thumbs.db
 
-# --- Cursor / editor ---
-.cursor/
+# --- Editors / tools ---
 .vscode/
 .idea/
+.cursor/
 
-# --- Propriu proiect ---
-# Ignorăm TOT folderul mare:
-PDF_to_Embeddings/materiale_didactice/**
+# --- Project-specific (exclude big stuff) ---
+embeddings_db/**
+install/**
+materiale_didactice/**
 
-# Dar permitem EXCEPȚIILE (cele două PDF-uri pentru test):
-!PDF_to_Embeddings/materiale_didactice/director_pedagogie/Biblia_Romania.pdf
-!PDF_to_Embeddings/materiale_didactice/Scoala_de_Muzica_George_Enescu/clasa_2/Dezvoltare_personala/Prof_Carl_Jung/A971.pdf
+# --- EXCEPTIONS: keep ONLY these two PDFs in repo ---
+!materiale_didactice/director_pedagogie/Biblia_Romania.pdf
+!materiale_didactice/Scoala_de_Muzica_George_Enescu/clasa_2/Dezvoltare_personala/Prof_Carl_Jung/A971.pdf
