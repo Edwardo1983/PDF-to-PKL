@@ -29,6 +29,11 @@ from chromadb.config import Settings
 from tqdm import tqdm
 import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from huggingface_hub import snapshot_download
+try:
+    from huggingface_hub.utils import LocalEntryNotFoundError
+except ImportError:  # Fallback for older huggingface_hub versions
+    LocalEntryNotFoundError = FileNotFoundError
 
 # OCR imports pentru PDF-uri dificile (imagini, scanări)
 try:
@@ -179,25 +184,63 @@ class PDFEmbeddingsConverter:
         logger.info(f"Loading {EMBEDDING_CONFIG.model} model...")
         with memory_managed_processing():
             local_model_path = os.getenv("LOCAL_SENTENCE_MODEL_PATH")
+            configured_model_name = EMBEDDING_CONFIG.model
+            model_source = local_model_path or configured_model_name
 
-            if self.allow_online_model_download or local_model_path:
-                model_source = local_model_path or EMBEDDING_CONFIG.model
-                try:
-                    self.model = SentenceTransformer(model_source)
-                    self.using_fallback_model = False
-                    self.embedding_model_name = Path(model_source).name or EMBEDDING_CONFIG.model
-                except Exception as exc:
+            try:
+                resolved_model_path = model_source
+                cache_folder = os.getenv("SENTENCE_TRANSFORMERS_HOME") or os.getenv("HF_HOME")
+
+                if local_model_path:
+                    logger.info("Loading SentenceTransformer model from local path: %s", local_model_path)
+                else:
+                    repo_id = model_source if "/" in model_source else f"sentence-transformers/{model_source}"
+                    logger.info(
+                        "Ensuring SentenceTransformer weights are available locally for model: %s", repo_id
+                    )
+                    try:
+                        resolved_model_path = snapshot_download(
+                            repo_id=repo_id,
+                            cache_dir=cache_folder,
+                            local_files_only=not self.allow_online_model_download,
+                        )
+                        logger.debug("Using cached SentenceTransformer model path: %s", resolved_model_path)
+                    except LocalEntryNotFoundError as cache_exc:
+                        if self.allow_online_model_download:
+                            logger.warning(
+                                "Initial local cache check failed (%s). Retrying with download enabled...",
+                                cache_exc,
+                            )
+                            resolved_model_path = snapshot_download(
+                                repo_id=repo_id,
+                                cache_dir=cache_folder,
+                                local_files_only=False,
+                            )
+                        else:
+                            raise FileNotFoundError(
+                                "Model weights not found in local Hugging Face cache. "
+                                "Provide LOCAL_SENTENCE_MODEL_PATH or enable ALLOW_ONLINE_MODEL_DOWNLOAD."
+                            ) from cache_exc
+
+                self.model = SentenceTransformer(resolved_model_path)
+                self.using_fallback_model = False
+                self.embedding_model_name = Path(resolved_model_path).name or configured_model_name
+            except Exception as exc:
+                if local_model_path:
                     logger.warning(
-                        "Could not load SentenceTransformer model (%s). Falling back to hashing embeddings.",
+                        "Could not load SentenceTransformer model from provided path (%s). Falling back to hashing embeddings.",
                         exc,
                     )
-                    self.model = HashingSentenceEmbedder(EMBEDDING_CONFIG.fallback_dimension)
-                    self.using_fallback_model = True
-                    self.embedding_model_name = f"hashing-{EMBEDDING_CONFIG.fallback_dimension}"
-            else:
-                logger.info(
-                    "Offline mode detected - using hashing-based embeddings. Set ALLOW_ONLINE_MODEL_DOWNLOAD=1 for SentenceTransformer."
-                )
+                elif self.allow_online_model_download:
+                    logger.warning(
+                        "Could not download SentenceTransformer model (%s). Falling back to hashing embeddings.",
+                        exc,
+                    )
+                else:
+                    logger.warning(
+                        "Could not load SentenceTransformer model from local cache (%s). Falling back to hashing embeddings.",
+                        exc,
+                    )
                 self.model = HashingSentenceEmbedder(EMBEDDING_CONFIG.fallback_dimension)
                 self.using_fallback_model = True
                 self.embedding_model_name = f"hashing-{EMBEDDING_CONFIG.fallback_dimension}"
