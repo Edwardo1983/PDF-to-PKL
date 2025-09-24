@@ -6,6 +6,7 @@ import re
 import threading
 import gc
 import logging
+import sys
 import contextlib
 import psutil
 import unicodedata
@@ -34,6 +35,13 @@ try:
     from huggingface_hub.utils import LocalEntryNotFoundError
 except ImportError:  # Fallback for older huggingface_hub versions
     LocalEntryNotFoundError = FileNotFoundError
+
+# Ensure console streams can emit UTF-8 characters on Windows
+for _stream_name in ('stdout', 'stderr'):
+    _stream = getattr(sys, _stream_name, None)
+    _reconfigure = getattr(_stream, 'reconfigure', None)
+    if callable(_reconfigure):
+        _reconfigure(encoding='utf-8', errors='backslashreplace')
 
 # OCR imports pentru PDF-uri dificile (imagini, scanări)
 try:
@@ -119,7 +127,7 @@ logging.basicConfig(
     level=getattr(logging, LOGGING_CONFIG.level.upper()),
     format=LOGGING_CONFIG.format,
     handlers=[
-        logging.FileHandler(LOGGING_CONFIG.log_file),
+        logging.FileHandler(LOGGING_CONFIG.log_file, encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
