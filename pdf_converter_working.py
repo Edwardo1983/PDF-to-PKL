@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from config import (
-    EMBEDDING_CONFIG, DB_CONFIG, EDUCATIONAL_KEYWORDS, 
+    EMBEDDING_CONFIG, DB_CONFIG, EDUCATIONAL_KEYWORDS,
     OCR_CONFIG, PROCESSING_CONFIG, LOGGING_CONFIG
 )
 from datetime import datetime
@@ -80,6 +80,11 @@ class HashingSentenceEmbedder:
 
     def get_sentence_embedding_dimension(self) -> int:
         return self.dimension
+
+
+class ResourceLimitExceeded(RuntimeError):
+    """Raised when memory or disk thresholds are exceeded during processing."""
+
 
 # Data classes pentru monitoring
 @dataclass
@@ -157,6 +162,8 @@ class PDFEmbeddingsConverter:
         self.embeddings_db_path = embeddings_db_path
         self.processed_files_path = os.path.join(embeddings_db_path, "processed_files.json")
         self._file_lock = threading.Lock()  # Lock pentru thread safety la processed_files.json
+        self._abort_processing: bool = False
+        self._abort_reason: str = ""
 
         self.allow_online_model_download = os.getenv("ALLOW_ONLINE_MODEL_DOWNLOAD", "0") == "1"
         if not self.allow_online_model_download:
@@ -168,7 +175,8 @@ class PDFEmbeddingsConverter:
         # Health checks la startup
         self._validate_environment()
         self._check_disk_space()
-        
+        self._check_runtime_resources()
+
         os.makedirs(embeddings_db_path, exist_ok=True)
         
         # Setari conservative pentru Intel 12 cores
@@ -251,11 +259,60 @@ class PDFEmbeddingsConverter:
             free_gb = disk.free / (1024**3)
 
             if free_gb < PROCESSING_CONFIG.disk_space_threshold_gb:
-                raise RuntimeError(f"Insufficient disk space: {free_gb:.1f}GB available (threshold: {PROCESSING_CONFIG.disk_space_threshold_gb}GB)")
+                reason = (
+                    f"Insufficient disk space: {free_gb:.1f}GB available "
+                    f"(threshold: {PROCESSING_CONFIG.disk_space_threshold_gb}GB)"
+                )
+                self._abort_processing = True
+                self._abort_reason = reason
+                raise RuntimeError(reason)
 
             logger.info(f"Disk space check: {free_gb:.1f}GB available")
         except Exception as e:
             logger.error(f"Disk space check failed: {e}")
+            raise
+
+    def _check_runtime_resources(self, require_disk: bool = True) -> None:
+        """Aplică pragurile configurate pentru memorie și spațiu pe disc."""
+        if self._abort_processing:
+            raise ResourceLimitExceeded(
+                self._abort_reason
+                or "Processing aborted due to previously detected resource limits"
+            )
+
+        try:
+            memory = psutil.virtual_memory()
+            memory_threshold = PROCESSING_CONFIG.memory_threshold_percent or 0
+            if memory_threshold and memory.percent >= memory_threshold:
+                reason = (
+                    f"Memory usage {memory.percent:.1f}% exceeded configured threshold "
+                    f"{memory_threshold:.1f}%"
+                )
+                if not self._abort_processing:
+                    self._abort_processing = True
+                    self._abort_reason = reason
+                raise ResourceLimitExceeded(reason)
+
+            if require_disk:
+                disk_path = self.embeddings_db_path
+                if not os.path.exists(disk_path):
+                    disk_path = os.path.dirname(disk_path) or "."
+                disk = psutil.disk_usage(disk_path)
+                free_gb = disk.free / (1024**3)
+                disk_threshold = PROCESSING_CONFIG.disk_space_threshold_gb or 0
+                if disk_threshold and free_gb <= disk_threshold:
+                    reason = (
+                        f"Available disk space {free_gb:.2f}GB is below configured threshold "
+                        f"{disk_threshold:.2f}GB"
+                    )
+                    if not self._abort_processing:
+                        self._abort_processing = True
+                        self._abort_reason = reason
+                    raise ResourceLimitExceeded(reason)
+        except ResourceLimitExceeded:
+            raise
+        except Exception as exc:
+            logger.error(f"Runtime resource check failed: {exc}")
             raise
     
     def setup_ocr_tools(self):
@@ -318,9 +375,11 @@ class PDFEmbeddingsConverter:
     def get_optimal_batch_size(self, chunk_count: Optional[int] = None) -> int:
         """Calculează batch size optim bazat pe memoria disponibilă și numărul de chunks"""
         try:
+            self._check_runtime_resources(require_disk=False)
             memory_percent = psutil.virtual_memory().percent
             available_gb = psutil.virtual_memory().available / (1024**3)
             cpu_count = psutil.cpu_count()
+            memory_threshold = PROCESSING_CONFIG.memory_threshold_percent or 0
 
             # Logică îmbunătățită pentru batch sizing
             base_batch = 16
@@ -329,7 +388,14 @@ class PDFEmbeddingsConverter:
                 chunk_count = 0
 
             # Ajustare bazată pe memorie
-            if memory_percent > 85:
+            if memory_threshold and memory_percent >= memory_threshold:
+                logger.warning(
+                    "Memory usage %.1f%% reached configured threshold %.1f%% - forcing minimal batch",
+                    memory_percent,
+                    memory_threshold,
+                )
+                base_batch = 1
+            elif memory_percent > 85:
                 base_batch = 4   # Foarte conservativ
             elif memory_percent > 75:
                 base_batch = 8   # Conservativ
@@ -370,8 +436,9 @@ class PDFEmbeddingsConverter:
             with retry_on_failure(max_retries=2, delay=2.0):
                 try:
                     logger.info(f"Processing with OCR: {os.path.basename(pdf_path)}")
-                    
+
                     # Convertește PDF în imagini cu retry
+                    self._check_runtime_resources(require_disk=False)
                     images = convert_from_path(
                         pdf_path,
                         dpi=OCR_CONFIG.dpi,
@@ -386,9 +453,10 @@ class PDFEmbeddingsConverter:
                         return ""
                     
                     extracted_text = []
-                    
+
                     # Procesează fiecare pagină cu OCR și memory management
                     for i, image in enumerate(tqdm(images, desc="OCR pages")):
+                        self._check_runtime_resources(require_disk=False)
                         try:
                             with memory_managed_processing():
                                 # Optimizare imagine pentru OCR
@@ -548,6 +616,7 @@ class PDFEmbeddingsConverter:
 
     def stream_text_with_pages(self, pdf_path: str) -> Iterator[Tuple[str, int]]:
         """Generează textul pagină cu pagină folosind prima metodă care reușește."""
+        self._check_runtime_resources(require_disk=False)
         is_extractable, reason = self.is_pdf_text_extractable(pdf_path)
         logger.info(f"Text analysis for {os.path.basename(pdf_path)}: {reason}")
 
@@ -566,10 +635,12 @@ class PDFEmbeddingsConverter:
         for method_name, method in extraction_methods:
             yielded = False
             try:
+                self._check_runtime_resources(require_disk=False)
                 for page_text, page_number in method(pdf_path):
                     if not yielded:
                         logger.info(f"Using {method_name} for {os.path.basename(pdf_path)}")
                     yielded = True
+                    self._check_runtime_resources(require_disk=False)
                     yield page_text, page_number
             except Exception as exc:
                 logger.warning(f"{method_name} extraction failed: {exc}")
@@ -609,6 +680,7 @@ class PDFEmbeddingsConverter:
         word_buffer: List[Tuple[str, int]] = []
 
         for page_text, page_number in self.stream_text_with_pages(pdf_path):
+            self._check_runtime_resources(require_disk=False)
             words = page_text.split()
             if not words:
                 continue
@@ -616,6 +688,7 @@ class PDFEmbeddingsConverter:
             word_buffer.extend((word, page_number) for word in words)
 
             while len(word_buffer) >= chunk_size:
+                self._check_runtime_resources(require_disk=False)
                 chunk_slice = word_buffer[:chunk_size]
                 chunk_words = [word for word, _ in chunk_slice]
 
@@ -639,6 +712,7 @@ class PDFEmbeddingsConverter:
 
         # Procesează cuvintele rămase
         if len(word_buffer) >= max(min_words, 1):
+            self._check_runtime_resources(require_disk=False)
             chunk_words = [word for word, _ in word_buffer]
             chunk_text = " ".join(chunk_words)
             chunk_metadata = {
@@ -699,20 +773,21 @@ class PDFEmbeddingsConverter:
     def generate_embeddings_streaming(self, chunks: List[str]) -> np.ndarray:
         """Generează embeddings cu streaming și dynamic batch sizing pentru optimizare memorie"""
         logger.info(f"Generating embeddings for {len(chunks)} chunks...")
-        
+
         # Calculează batch size optim dinamic
         optimal_batch_size = self.get_optimal_batch_size(len(chunks))
         logger.info(f"Using dynamic batch size: {optimal_batch_size}")
-        
+
         all_embeddings = []
         successful = 0
         failed = 0
-        
+
         with memory_managed_processing():
             for i in range(0, len(chunks), optimal_batch_size):
+                self._check_runtime_resources()
                 batch_end = min(i + optimal_batch_size, len(chunks))
                 batch_chunks = chunks[i:batch_end]
-                
+
                 try:
                     batch_num = i//optimal_batch_size + 1
                     total_batches = (len(chunks) + optimal_batch_size - 1)//optimal_batch_size
@@ -870,6 +945,7 @@ class PDFEmbeddingsConverter:
             return
 
         with retry_on_failure(max_retries=3, delay=1.0):
+            self._check_runtime_resources()
             prefixed_chunks = [RETRIEVAL_INSTRUCTION + chunk for chunk in chunk_texts]
             embeddings = self.model.encode(
                 prefixed_chunks,
@@ -877,6 +953,7 @@ class PDFEmbeddingsConverter:
                 show_progress_bar=False,
                 convert_to_numpy=True,
             )
+            self._check_runtime_resources()
 
             collection.add(
                 embeddings=embeddings.tolist(),
@@ -914,6 +991,14 @@ class PDFEmbeddingsConverter:
             return False
 
         try:
+            self._check_runtime_resources()
+        except ResourceLimitExceeded as exc:
+            logger.error(f"Resource constraints prevent processing {pdf_path}: {exc}")
+            if progress_callback:
+                progress_callback(0.0, str(exc))
+            return False
+
+        try:
             file_hash = self.get_file_hash(pdf_path)
         except (OSError, IOError) as exc:
             logger.error(f'Failed to read PDF for hashing: {exc}')
@@ -929,6 +1014,7 @@ class PDFEmbeddingsConverter:
         logger.info(f"Processing optimized: {os.path.basename(pdf_path)}")
 
         try:
+            self._check_runtime_resources()
             with memory_managed_processing():
                 if progress_callback:
                     progress_callback(0.05, "Analyzing PDF structure...")
@@ -980,7 +1066,9 @@ class PDFEmbeddingsConverter:
                     chunk_count += 1
                     words_total += chunk_meta["word_count"]
 
+                    self._check_runtime_resources(require_disk=False)
                     if len(chunk_buffer) >= optimal_batch_size:
+                        self._check_runtime_resources()
                         self._persist_embeddings_batch(
                             collection, chunk_buffer, metadata_buffer, id_buffer
                         )
@@ -995,6 +1083,7 @@ class PDFEmbeddingsConverter:
                             )
 
                 if chunk_buffer:
+                    self._check_runtime_resources()
                     self._persist_embeddings_batch(
                         collection, chunk_buffer, metadata_buffer, id_buffer
                     )
@@ -1032,28 +1121,40 @@ class PDFEmbeddingsConverter:
 
                 return True
 
+        except ResourceLimitExceeded as exc:
+            logger.error(f"Processing aborted for {pdf_path}: {exc}")
+            if progress_callback:
+                progress_callback(0.0, str(exc))
+            return False
         except Exception as e:
             logger.error(f"Processing failed: {e}")
             return False
     
-    def process_pdfs_parallel(self, pdf_paths: List[str], max_workers: int = None, 
+    def process_pdfs_parallel(self, pdf_paths: List[str], max_workers: int = None,
                             progress_callback: Callable = None) -> List[ProcessingResult]:
         """Procesează multiple PDF-uri în paralel cu monitoring"""
         if max_workers is None:
             max_workers = min(PROCESSING_CONFIG.max_workers, psutil.cpu_count())
-        
+
         logger.info(f"Starting parallel processing of {len(pdf_paths)} PDFs with {max_workers} workers")
-        
+
         results = []
         start_time = time.time()
-        
+
+        try:
+            self._check_runtime_resources()
+        except ResourceLimitExceeded as exc:
+            logger.error(f"Cannot start parallel processing due to resource limits: {exc}")
+            return []
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
             future_to_path = {
-                executor.submit(self._process_single_pdf_with_monitoring, pdf_path): pdf_path 
+                executor.submit(self._process_single_pdf_with_monitoring, pdf_path): pdf_path
                 for pdf_path in pdf_paths
             }
-            
+            abort_triggered = False
+
             # Process completed tasks with progress tracking
             with tqdm(total=len(pdf_paths), desc="Processing PDFs") as pbar:
                 for future in as_completed(future_to_path):
@@ -1061,7 +1162,7 @@ class PDFEmbeddingsConverter:
                     try:
                         result = future.result()
                         results.append(result)
-                        
+
                         # Update stats
                         self.processing_stats.total_files += 1
                         if result.success:
@@ -1069,25 +1170,44 @@ class PDFEmbeddingsConverter:
                             self.processing_stats.total_chunks += result.chunks_created
                         else:
                             self.processing_stats.failed += 1
-                        
+
                         self.processing_stats.total_processing_time += result.processing_time
                         self.processing_stats.memory_peak = max(
-                            self.processing_stats.memory_peak, 
+                            self.processing_stats.memory_peak,
                             result.memory_used_mb
                         )
-                        
+
                         # Progress callback
                         if progress_callback:
                             progress = len(results) / len(pdf_paths)
                             progress_callback(progress, f"Processed {len(results)}/{len(pdf_paths)} files")
-                        
+
                         pbar.update(1)
                         pbar.set_postfix({
                             'Success': self.processing_stats.successful,
                             'Failed': self.processing_stats.failed,
                             'Success Rate': f"{self.processing_stats.successful/self.processing_stats.total_files*100:.1f}%"
                         })
-                        
+
+                        if self._abort_processing:
+                            abort_triggered = True
+                            break
+
+                    except ResourceLimitExceeded as exc:
+                        logger.error(f"Resource limits exceeded while processing {pdf_path}: {exc}")
+                        if not self._abort_processing:
+                            self._abort_processing = True
+                        if not self._abort_reason:
+                            self._abort_reason = str(exc)
+                        self.processing_stats.total_files += 1
+                        self.processing_stats.failed += 1
+                        results.append(ProcessingResult(
+                            file_path=pdf_path,
+                            success=False,
+                            error_message=str(exc)
+                        ))
+                        abort_triggered = True
+                        break
                     except Exception as e:
                         logger.error(f"Error processing {pdf_path}: {e}")
                         results.append(ProcessingResult(
@@ -1097,19 +1217,45 @@ class PDFEmbeddingsConverter:
                         ))
                         self.processing_stats.failed += 1
                         pbar.update(1)
-        
+
+                        if self._abort_processing:
+                            abort_triggered = True
+                            break
+
+                if abort_triggered:
+                    for pending_future in future_to_path:
+                        if not pending_future.done():
+                            pending_future.cancel()
+
         total_time = time.time() - start_time
         logger.info(f"Parallel processing completed in {total_time:.2f}s")
         logger.info(f"Results: {self.processing_stats.successful} successful, {self.processing_stats.failed} failed")
-        
+
+        if self._abort_processing:
+            logger.warning(
+                "Processing aborted due to resource constraints: %s",
+                self._abort_reason or "threshold reached"
+            )
+
         return results
     
     def _process_single_pdf_with_monitoring(self, pdf_path: str) -> ProcessingResult:
         """Procesează un singur PDF cu monitoring detaliat"""
         start_time = time.time()
         initial_memory = psutil.Process().memory_info().rss / 1024 / 1024  # MB
-        
+
         try:
+            try:
+                self._check_runtime_resources()
+            except ResourceLimitExceeded as exc:
+                return ProcessingResult(
+                    file_path=pdf_path,
+                    success=False,
+                    processing_time=time.time() - start_time,
+                    error_message=str(exc),
+                    memory_used_mb=0,
+                )
+
             # Verifică dacă e deja procesat
             file_hash = self.get_file_hash(pdf_path)
             if pdf_path in self.processed_files and self.processed_files[pdf_path] == file_hash:
@@ -1119,14 +1265,17 @@ class PDFEmbeddingsConverter:
                     processing_time=time.time() - start_time,
                     memory_used_mb=0
                 )
-            
+
             # Procesează cu monitoring
             success = self.process_pdf(pdf_path)
-            
+            error_message = ""
+            if not success and self._abort_processing:
+                error_message = self._abort_reason or "Processing aborted due to resource constraints"
+
             processing_time = time.time() - start_time
             final_memory = psutil.Process().memory_info().rss / 1024 / 1024
             memory_used = final_memory - initial_memory
-            
+
             # Estimează numărul de chunks (simplificat)
             chunks_created = 0
             if success:
@@ -1142,9 +1291,15 @@ class PDFEmbeddingsConverter:
                 success=success,
                 chunks_created=chunks_created,
                 processing_time=processing_time,
-                memory_used_mb=memory_used
+                memory_used_mb=memory_used,
+                error_message=error_message,
             )
-            
+
+        except ResourceLimitExceeded as exc:
+            self._abort_processing = True
+            if not self._abort_reason:
+                self._abort_reason = str(exc)
+            raise
         except Exception as e:
             return ProcessingResult(
                 file_path=pdf_path,
@@ -1170,6 +1325,8 @@ class PDFEmbeddingsConverter:
     def reset_processing_stats(self):
         """Resetează statisticile de procesare"""
         self.processing_stats = ProcessingStats()
+        self._abort_processing = False
+        self._abort_reason = ""
         logger.info("Processing statistics reset")
     
     def enhanced_search_educational(self, query: str, top_k: int = 5, collection_name: str = None):
