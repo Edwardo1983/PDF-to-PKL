@@ -1,4 +1,5 @@
 import os
+import argparse
 import json
 import hashlib
 import time
@@ -31,6 +32,7 @@ from tqdm import tqdm
 import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from huggingface_hub import snapshot_download
+import shutil
 try:
     from huggingface_hub.utils import LocalEntryNotFoundError
 except ImportError:  # Fallback for older huggingface_hub versions
@@ -172,6 +174,10 @@ class PDFEmbeddingsConverter:
     def __init__(self, embeddings_db_path: str = "./embeddings_db"):
         logger.info("Initializing optimized PDF converter...")
 
+        env_db_path = os.getenv("EMBEDDINGS_DB_PATH")
+        if embeddings_db_path == "./embeddings_db" and env_db_path:
+            embeddings_db_path = env_db_path
+
         self.embeddings_db_path = embeddings_db_path
         self.processed_files_path = os.path.join(embeddings_db_path, "processed_files.json")
         self._file_lock = threading.Lock()  # Lock pentru thread safety la processed_files.json
@@ -189,9 +195,18 @@ class PDFEmbeddingsConverter:
         self._validate_environment()
         self._check_disk_space()
         self._check_runtime_resources()
+        self._ensure_embeddings_directory(self.embeddings_db_path)
 
-        os.makedirs(embeddings_db_path, exist_ok=True)
-        
+        chunk_size = EMBEDDING_CONFIG.chunk_size
+        chunk_overlap = EMBEDDING_CONFIG.overlap
+        logger.info(
+            "Chunking configuration: size=%s tokens, overlap=%s tokens (env CHUNK_SIZE=%s, CHUNK_OVERLAP=%s)",
+            chunk_size,
+            chunk_overlap,
+            os.getenv("CHUNK_SIZE"),
+            os.getenv("CHUNK_OVERLAP"),
+        )
+
         # Setari conservative pentru Intel 12 cores
         torch.set_num_threads(4)
         os.environ['OMP_NUM_THREADS'] = '4'
@@ -263,7 +278,7 @@ class PDFEmbeddingsConverter:
 
         logger.info("Initializing ChromaDB with cosine metric...")
         with retry_on_failure(max_retries=3):
-            self.client = chromadb.PersistentClient(path=embeddings_db_path)
+            self.client = self._create_chroma_client(self.embeddings_db_path)
 
         self.setup_ocr_tools()
         self.processed_files = self.load_processed_files()
@@ -277,7 +292,37 @@ class PDFEmbeddingsConverter:
             logger.info("✅ Optimized converter is functional!")
         else:
             logger.error("❌ Potential model issues detected")
-    
+
+    def _create_chroma_client(self, db_path: str):
+        telemetry_env = os.getenv("CHROMA_TELEMETRY")
+        anonymized_telemetry = False
+        if telemetry_env is not None:
+            anonymized_telemetry = telemetry_env not in {"0", "false", "False", ""}
+
+        settings = Settings(anonymized_telemetry=anonymized_telemetry)
+        return chromadb.PersistentClient(path=db_path, settings=settings)
+
+    def _ensure_embeddings_directory(self, db_path: str) -> None:
+        path_obj = Path(db_path)
+
+        try:
+            path_obj.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            raise RuntimeError(f"Cannot create embeddings directory at {db_path}: {exc}")
+
+        if not path_obj.is_dir():
+            raise NotADirectoryError(f"Embeddings path {db_path} is not a directory")
+
+        if not os.access(path_obj, os.R_OK | os.W_OK):
+            raise PermissionError(f"Insufficient permissions for embeddings directory {db_path}")
+
+        sqlite_path = path_obj / "chroma.sqlite3"
+        if not sqlite_path.exists():
+            logger.info(
+                "chroma.sqlite3 not found at %s - a new database will be created on first write",
+                sqlite_path,
+            )
+
     def _validate_environment(self):
         """Validează mediul de lucru și dependențele"""
         logger.info("Validating environment...")
@@ -1464,53 +1509,148 @@ class PDFEmbeddingsConverter:
             
             # Colectează rezultate din toate colecțiile cu scoruri
             all_items = []
-            
+
             for collection in collections_to_search:
                 try:
+                    try:
+                        collection_size = collection.count()
+                    except Exception as size_exc:
+                        logger.warning("Could not determine size for collection %s: %s", collection.name, size_exc)
+                        collection_size = top_k
+
+                    effective_top_k = min(top_k, collection_size) if collection_size is not None else top_k
+                    if top_k > collection_size and collection_size is not None:
+                        logger.info(
+                            "Clamped top_k from %s to %s for collection %s (collection size)",
+                            top_k,
+                            effective_top_k,
+                            collection.name,
+                        )
+
+                    if effective_top_k <= 0:
+                        continue
+
                     results = collection.query(
                         query_embeddings=query_embedding.tolist(),
-                        n_results=min(top_k, 5)  # Ia mai puține din fiecare colecție
+                        n_results=effective_top_k
                     )
-                    
+
                     if results and results.get('documents') and results['documents'][0]:
                         docs = results["documents"][0]
                         metadatas = results.get("metadatas", [[]])[0] or [{} for _ in docs]
                         distances = results.get("distances", [[]])[0] or [1.0 for _ in docs]
-                        
+                        ids = results.get("ids", [[]])[0] or [None for _ in docs]
+
                         # Pentru cosine similarity, convertește distanțele în similarități
                         similarities = [1 - dist for dist in distances]
-                        
-                        for doc, meta, sim in zip(docs, metadatas, similarities):
+
+                        for doc, meta, sim, doc_id in zip(docs, metadatas, similarities, ids):
                             all_items.append({
                                 "document": doc,
                                 "metadata": meta,
                                 "similarity": sim,
-                                "collection": collection.name
+                                "collection": collection.name,
+                                "id": doc_id,
                             })
-                            
+
                 except Exception as e:
                     print(f"Eroare căutare în {collection.name}: {e}")
-            
+
             # Sortare globală după similaritate (descrescător)
             all_items.sort(key=lambda x: x["similarity"], reverse=True)
-            
+
+            # Elimină duplicatele pe baza ID-urilor (și textului ca fallback)
+            unique_items = []
+            seen_ids = set()
+            seen_documents = set()
+
+            for item in all_items:
+                item_id = item.get("id")
+                document_key = item["document"]
+
+                if item_id:
+                    if item_id in seen_ids:
+                        continue
+                    seen_ids.add(item_id)
+                else:
+                    if document_key in seen_documents:
+                        continue
+                    seen_documents.add(document_key)
+
+                unique_items.append(item)
+
             # Returnează top_k global cu format compatibil
-            top_items = all_items[:top_k]
-            
+            top_items = unique_items[:top_k]
+
             if top_items:
                 result = {
                     "documents": [[item["document"] for item in top_items]],
                     "metadatas": [[item["metadata"] for item in top_items]],
                     "similarities": [[item["similarity"] for item in top_items]],
-                    "collections": [[item["collection"] for item in top_items]]
+                    "collections": [[item["collection"] for item in top_items]],
+                    "ids": [[item.get("id") for item in top_items]],
                 }
                 return result
             else:
-                return {"documents": [[]], "metadatas": [[]], "similarities": [[]], "collections": [[]]}
+                return {
+                    "documents": [[]],
+                    "metadatas": [[]],
+                    "similarities": [[]],
+                    "collections": [[]],
+                    "ids": [[]],
+                }
                 
         except Exception as e:
             print(f"Eroare căutare optimizată: {e}")
             return None
+
+    def prune_collections(self, dry_run: bool = False) -> List[str]:
+        """Șterge colecțiile fără documente sau marcate ca temporare."""
+
+        removed_collections: List[str] = []
+
+        for collection in self.client.list_collections():
+            collection_name = getattr(collection, "name", "unknown")
+            try:
+                count = collection.count()
+            except Exception as exc:
+                logger.warning("Could not retrieve count for collection %s: %s", collection_name, exc)
+                continue
+
+            if count == 0 or collection_name.startswith("tmp_"):
+                removed_collections.append(collection_name)
+                if not dry_run:
+                    try:
+                        self.client.delete_collection(collection_name)
+                        logger.info("Removed collection %s during prune", collection_name)
+                    except Exception as exc:
+                        logger.error("Failed to delete collection %s: %s", collection_name, exc)
+
+        if dry_run:
+            logger.info("Dry-run prune identified %d collections: %s", len(removed_collections), removed_collections)
+        else:
+            logger.info("Prune removed %d collections", len(removed_collections))
+
+        return removed_collections
+
+    def snapshot_embeddings_db(self, destination_root: Optional[str] = None) -> Path:
+        """Creează un snapshot al bazei de embeddings într-un folder dedicat."""
+
+        destination_root = destination_root or "snapshots"
+        root_path = Path(destination_root)
+        root_path.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
+        snapshot_path = root_path / f"embeddings_db_{timestamp}"
+
+        if snapshot_path.exists():
+            raise FileExistsError(f"Snapshot path already exists: {snapshot_path}")
+
+        ignore_patterns = shutil.ignore_patterns("*.tmp", "*.lock", "*.wal")
+        shutil.copytree(self.embeddings_db_path, snapshot_path, ignore=ignore_patterns)
+        logger.info("Snapshot created at %s", snapshot_path)
+
+        return snapshot_path
     
     def cleanup_resources(self):
         """Cleanup manual pentru resurse, temp files și optimizare disk usage"""
@@ -1557,7 +1697,7 @@ class PDFEmbeddingsConverter:
                 print(f"ChromaDB activ cu {len(test_collections)} colecții")
             except Exception as e:
                 print(f"Reconectez ChromaDB după eroare: {e}")
-                self.client = chromadb.PersistentClient(path=self.embeddings_db_path)
+                self.client = self._create_chroma_client(self.embeddings_db_path)
                 
                 print("✅ Cleanup resurse completat")
             
@@ -1606,5 +1746,51 @@ class PDFEmbeddingsConverter:
             except Exception as e:
                 print(f"  - {collection.name}: eroare - {e}")
 
-if __name__ == "__main__":
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="PDF to embeddings maintenance utilities")
+    parser.add_argument(
+        "--prune-collections",
+        action="store_true",
+        help="Șterge colecțiile goale și cele prefixate cu tmp_.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Rulează prune fără a șterge efectiv colecțiile.",
+    )
+    parser.add_argument(
+        "--snapshot-db",
+        action="store_true",
+        help="Creează un snapshot al bazei de embeddings.",
+    )
+    parser.add_argument(
+        "--snapshot-dest",
+        default=None,
+        help="Directorul rădăcină pentru snapshot-uri (default: snapshots).",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+
     converter = PDFEmbeddingsConverter()
+
+    if args.prune_collections:
+        removed = converter.prune_collections(dry_run=args.dry_run)
+        if args.dry_run:
+            print(f"Dry-run prune: {removed}")
+        else:
+            print(f"Pruned collections: {removed}")
+
+    if args.snapshot_db:
+        snapshot_path = converter.snapshot_embeddings_db(destination_root=args.snapshot_dest)
+        print(f"Snapshot created at: {snapshot_path}")
+
+    if not args.prune_collections and not args.snapshot_db:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

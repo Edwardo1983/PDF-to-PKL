@@ -1,10 +1,16 @@
 import os
 import time
+
+import pytest
+
 from pdf_converter_working import PDFEmbeddingsConverter
 
 def test_with_memory_limits():
     test_dir = r'C:\Users\Opaop\Desktop\Conversie PDF to PKL\PDF_to_Embeddings\materiale_didactice\Scoala_de_Muzica_George_Enescu\clasa_2\Dezvoltare_personala\Prof_Carl_Jung'
-    
+
+    if not os.path.exists(test_dir):
+        pytest.skip("Materialele Carl Jung nu sunt disponibile în mediul de test")
+
     converter = PDFEmbeddingsConverter()
     
     # Gaseste PDF-urile

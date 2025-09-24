@@ -78,7 +78,16 @@ def load_config_from_env():
     if os.getenv("EMBEDDING_MODEL"):
         EMBEDDING_CONFIG.model = os.getenv("EMBEDDING_MODEL")
     if os.getenv("CHUNK_SIZE"):
-        EMBEDDING_CONFIG.chunk_size = int(os.getenv("CHUNK_SIZE"))
+        try:
+            EMBEDDING_CONFIG.chunk_size = int(os.getenv("CHUNK_SIZE"))
+        except ValueError:
+            # Valoare fallback recomandată pentru deployment-uri restricționate
+            EMBEDDING_CONFIG.chunk_size = 800
+    if os.getenv("CHUNK_OVERLAP"):
+        try:
+            EMBEDDING_CONFIG.overlap = int(os.getenv("CHUNK_OVERLAP"))
+        except ValueError:
+            EMBEDDING_CONFIG.overlap = 120
     if os.getenv("BATCH_SIZE"):
         EMBEDDING_CONFIG.batch_size = int(os.getenv("BATCH_SIZE"))
     
