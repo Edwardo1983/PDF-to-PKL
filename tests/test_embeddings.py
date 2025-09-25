@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 
 import pdf_converter_working as converter_module
-from pdf_converter_working import PDFEmbeddingsConverter
+from pdf_converter_working import (
+    PDFEmbeddingsConverter,
+    ensure_standard_metadata,
+    where_from,
+)
 
 
 class FakeModel:
@@ -23,12 +27,14 @@ class FakeCollection:
         self._distances = [0.1 for _ in documents]
         self.add_called = False
         self.last_n_results = None
+        self.last_where = None
 
     def count(self):
         return len(self._documents)
 
-    def query(self, query_embeddings, n_results: int):
+    def query(self, query_embeddings, n_results: int, where=None):
         self.last_n_results = n_results
+        self.last_where = where
         limit = min(n_results, len(self._documents))
         return {
             "documents": [self._documents[:limit]],
@@ -92,6 +98,14 @@ def test_topk_clamped_to_collection_size(converter, caplog):
     assert any("Clamped top_k" in record.message for record in caplog.records)
 
 
+def test_where_filters_are_forwarded(converter):
+    where_clause = {"grade": "clasa_2"}
+    converter.search_similar("învățare", top_k=2, where=where_clause)
+
+    collection = converter.client.get_collection("educatie")
+    assert collection.last_where == where_clause
+
+
 def test_telemetry_off_when_env_set(monkeypatch):
     instance = PDFEmbeddingsConverter.__new__(PDFEmbeddingsConverter)
     os.environ["CHROMA_TELEMETRY"] = "0"
@@ -108,3 +122,27 @@ def test_telemetry_off_when_env_set(monkeypatch):
     assert client.path == "/tmp/embeddings"
     assert getattr(captured["settings"], "anonymized_telemetry", None) is False
     monkeypatch.delenv("CHROMA_TELEMETRY", raising=False)
+
+
+def test_ensure_standard_metadata_includes_schema():
+    pdf_path = (
+        "materiale_didactice/Scoala_de_Muzica_George_Enescu/"
+        "clasa_2/Dezvoltare_personala/Prof_Carl_Jung/A971.pdf"
+    )
+    base_metadata = {"page_from": 2, "tags": ["initial"]}
+
+    enriched = ensure_standard_metadata(pdf_path, 3, base_metadata)
+
+    assert enriched["source_file"] == "A971.pdf"
+    assert enriched["grade"] == "clasa_2"
+    assert enriched["subject"] == "dezvoltare_personala"
+    assert "dezvoltare_personala" in enriched["tags"]
+    assert "clasa_2" in enriched["tags"]
+    assert enriched["page"] == 2
+
+
+def test_where_from_helper_builds_filters():
+    where_clause = where_from("Clasa_2", "Dezvoltare_personala")
+
+    assert where_clause["grade"] == "clasa_2"
+    assert where_clause["tags"]["$contains"] == "dezvoltare_personala"

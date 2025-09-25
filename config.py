@@ -2,7 +2,7 @@
 
 import os
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 @dataclass
 class EmbeddingConfig:
@@ -17,6 +17,8 @@ class EmbeddingConfig:
     retry_delay: float = 1.0
     retry_backoff: float = 2.0
     fallback_dimension: int = 384
+    bible_chunk_size: Optional[int] = None
+    bible_overlap: Optional[int] = None
 
 @dataclass
 class OCRConfig:
@@ -88,6 +90,16 @@ def load_config_from_env():
             EMBEDDING_CONFIG.overlap = int(os.getenv("CHUNK_OVERLAP"))
         except ValueError:
             EMBEDDING_CONFIG.overlap = 120
+    if os.getenv("CHUNK_SIZE_BIBLE"):
+        try:
+            EMBEDDING_CONFIG.bible_chunk_size = int(os.getenv("CHUNK_SIZE_BIBLE")) or None
+        except ValueError:
+            EMBEDDING_CONFIG.bible_chunk_size = None
+    if os.getenv("OVERLAP_BIBLE"):
+        try:
+            EMBEDDING_CONFIG.bible_overlap = int(os.getenv("OVERLAP_BIBLE")) or None
+        except ValueError:
+            EMBEDDING_CONFIG.bible_overlap = None
     if os.getenv("BATCH_SIZE"):
         EMBEDDING_CONFIG.batch_size = int(os.getenv("BATCH_SIZE"))
     
