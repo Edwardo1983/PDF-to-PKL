@@ -14,13 +14,19 @@ import unicodedata
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from config import (
-    EMBEDDING_CONFIG, DB_CONFIG, EDUCATIONAL_KEYWORDS,
-    OCR_CONFIG, PROCESSING_CONFIG, LOGGING_CONFIG
-)
 from datetime import datetime
+from itertools import zip_longest
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Callable, Iterable, Iterator
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+
+from config import (
+    EMBEDDING_CONFIG,
+    DB_CONFIG,
+    EDUCATIONAL_KEYWORDS,
+    OCR_CONFIG,
+    PROCESSING_CONFIG,
+    LOGGING_CONFIG,
+)
 import PyPDF2
 import pdfplumber
 import fitz  # PyMuPDF
@@ -56,6 +62,162 @@ except ImportError:
 
 # Instrucțiunea pentru BGE/GTE în modul retrieval
 RETRIEVAL_INSTRUCTION = "Represent this sentence for retrieval: "
+
+
+ROMANIAN_DIACRITIC_MAP = {
+    "ş": "ș",
+    "Ş": "Ș",
+    "ţ": "ț",
+    "Ţ": "Ț",
+    "ã": "ă",
+    "Ã": "Ă",
+}
+
+ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\u200e\u200f\u2060\ufeff]")
+WHITESPACE_PATTERN = re.compile(r"[\t\f\v\xa0]")
+
+
+def normalize_romanian_text(text: str) -> Tuple[str, int]:
+    """Normalizează textul românesc păstrând diacriticele și spațierea firească."""
+
+    if not text:
+        return "", 0
+
+    original_text = text
+    normalized = unicodedata.normalize("NFC", text)
+
+    for bad_char, replacement in ROMANIAN_DIACRITIC_MAP.items():
+        if bad_char in normalized:
+            normalized = normalized.replace(bad_char, replacement)
+
+    normalized = ZERO_WIDTH_PATTERN.sub("", normalized)
+    normalized = normalized.replace("\r", "\n")
+    normalized = WHITESPACE_PATTERN.sub(" ", normalized)
+    normalized = normalized.replace("\n", " ")
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = "".join(
+        ch
+        for ch in normalized
+        if ch.isprintable() or ch == " "
+    ).strip()
+
+    diff_count = sum(
+        1
+        for orig_char, new_char in zip_longest(
+            original_text, normalized, fillvalue=""
+        )
+        if orig_char != new_char
+    )
+
+    return normalized, diff_count
+
+
+def _slugify_tag(value: str) -> str:
+    value = value.strip().lower().replace(" ", "_")
+    value = re.sub(r"[^a-z0-9_]+", "_", value)
+    value = re.sub(r"_+", "_", value)
+    return value.strip("_")
+
+
+def infer_educational_context(file_path: str) -> Tuple[str, str, str, List[str]]:
+    """Derive grade, subject, institution and auxiliary tags from a file path."""
+
+    path = Path(file_path)
+    parts = [part for part in path.parts if part not in {".", ""}]
+
+    grade: Optional[str] = None
+    subject: Optional[str] = None
+    institution: Optional[str] = None
+    extra_tags: List[str] = []
+
+    for index, part in enumerate(parts):
+        lower_part = part.lower()
+
+        if grade is None and re.fullmatch(r"clasa_?\d+", lower_part):
+            digits = re.search(r"\d+", lower_part)
+            if digits:
+                grade = f"clasa_{digits.group(0)}"
+            else:
+                grade = lower_part.replace("clasa", "clasa_")
+            if index + 1 < len(parts) - 1:
+                subject = _slugify_tag(parts[index + 1]) or subject
+            if index > 0:
+                institution = parts[index - 1]
+            continue
+
+        if institution is None and (
+            "scoala" in lower_part
+            or "liceu" in lower_part
+            or "colegiu" in lower_part
+            or "director" in lower_part
+        ):
+            institution = part
+
+        if subject is None and "dezvoltare" in lower_part:
+            subject = _slugify_tag(part)
+
+        if "prof" in lower_part or "invat" in lower_part:
+            extra_tags.append(_slugify_tag(part))
+
+    if subject is None and parts:
+        subject = _slugify_tag(Path(parts[-1]).stem)
+
+    if grade is None:
+        grade = "clasa_0"
+
+    if institution is None and len(parts) >= 2:
+        institution = parts[-2]
+
+    extra_tags = [tag for tag in extra_tags if tag]
+
+    return grade, subject or "general", institution or "general", extra_tags
+
+
+def ensure_standard_metadata(
+    pdf_path: str,
+    chunk_index: int,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Completează metadata cu schema standardizată."""
+
+    base: Dict[str, Any] = dict(metadata or {})
+
+    base["source_file"] = os.path.basename(pdf_path)
+    base.setdefault("chunk_index", chunk_index)
+    if "page" not in base and isinstance(base.get("page_from"), int):
+        base["page"] = base["page_from"]
+
+    grade, subject, institution, extra_tags = infer_educational_context(pdf_path)
+
+    base["grade"] = grade
+    base["subject"] = subject
+    base["institution"] = institution
+
+    tags = list(base.get("tags", []))
+    tags.extend([subject, grade])
+    if institution:
+        tags.append(_slugify_tag(institution))
+    tags.extend(extra_tags)
+
+    base["tags"] = sorted({tag for tag in (_slugify_tag(tag) for tag in tags) if tag})
+
+    return base
+
+
+def where_from(grade: Optional[str] = None, subject: Optional[str] = None) -> Dict[str, Any]:
+    """Construiește un filtru `where` pentru căutările educaționale."""
+
+    where: Dict[str, Any] = {}
+
+    if grade:
+        where["grade"] = _slugify_tag(grade) or grade
+
+    if subject:
+        subject_tag = _slugify_tag(subject) or subject
+        where.setdefault("tags", {})
+        where["tags"]["$contains"] = subject_tag
+
+    return where
 
 
 class HashingSentenceEmbedder:
@@ -624,17 +786,14 @@ class PDFEmbeddingsConverter:
         if not text:
             return ""
 
-        text = unicodedata.normalize("NFKC", text)
-        text = unicodedata.normalize("NFKD", text)
-        text = text.encode("ascii", "ignore").decode("ascii")
-        text = text.replace("\x00", " ").replace("\xa0", " ")
-        text = text.replace("\r", "\n")
-        text = re.sub(r"-\s*\n", "", text)  # Unește cuvintele despărțite la capăt de linie
-        text = re.sub(r"\n+", "\n", text)
-        text = re.sub(r"[\t\u200b]+", " ", text)
-        text = re.sub(r"\s+", " ", text)
-        cleaned = "".join(ch for ch in text if ch.isprintable() or ch in "\n ")
-        return cleaned.strip()
+        text = text.replace("\x00", " ")
+        text = re.sub(r"-\s*\n", "", text)
+        normalized, diff = normalize_romanian_text(text)
+
+        if hasattr(self, "_normalization_changes"):
+            self._normalization_changes += diff
+
+        return normalized
 
     def _stream_text_fitz(self, pdf_path: str) -> Iterator[Tuple[str, int]]:
         try:
@@ -818,6 +977,31 @@ class PDFEmbeddingsConverter:
                 "word_count": len(chunk_words),
             }
             yield chunk_text, chunk_metadata
+
+    def _chunk_config_for(self, pdf_path: str) -> Tuple[int, int]:
+        """Returnează configurația de chunking pentru un anumit fișier."""
+
+        default_size = EMBEDDING_CONFIG.chunk_size
+        default_overlap = EMBEDDING_CONFIG.overlap
+
+        file_lower = os.path.basename(pdf_path).lower()
+
+        if "biblia" in file_lower or "bible" in file_lower:
+            chunk_size = EMBEDDING_CONFIG.bible_chunk_size or max(default_size * 2, default_size)
+            overlap = (
+                EMBEDDING_CONFIG.bible_overlap
+                if EMBEDDING_CONFIG.bible_overlap is not None
+                else max(0, default_overlap // 2)
+            )
+            logger.info(
+                "Using Bible chunk configuration for %s (size=%s, overlap=%s)",
+                os.path.basename(pdf_path),
+                chunk_size,
+                overlap,
+            )
+            return max(1, chunk_size), max(0, overlap)
+
+        return max(1, default_size), max(0, default_overlap)
 
     def advanced_chunk_text(self, text: str, text_pages: List[Tuple[str, int]],
                        chunk_size: int = None, overlap: int = None) -> Tuple[List[str], List[Dict]]:
@@ -1067,6 +1251,7 @@ class PDFEmbeddingsConverter:
     def process_pdf(self, pdf_path: str, progress_callback=None) -> bool:
         """Procesează PDF cu toate optimizările, progress tracking și resume capability"""
         start_time = time.time()
+        self._normalization_changes = 0
 
         if not pdf_path:
             logger.error('PDF path is required for processing')
@@ -1140,7 +1325,13 @@ class PDFEmbeddingsConverter:
                 chunk_count = 0
                 words_total = 0
 
-                for chunk_text, chunk_meta in self.stream_chunks(pdf_path):
+                chunk_size, overlap = self._chunk_config_for(pdf_path)
+
+                for chunk_text, chunk_meta in self.stream_chunks(
+                    pdf_path,
+                    chunk_size=chunk_size,
+                    overlap=overlap,
+                ):
                     if progress_callback and chunk_count == 0:
                         progress_callback(0.25, "Chunking text and generating embeddings...")
 
@@ -1154,6 +1345,12 @@ class PDFEmbeddingsConverter:
                         "word_count": chunk_meta["word_count"],
                         "file_hash": file_hash,
                     }
+
+                    metadata = ensure_standard_metadata(
+                        pdf_path,
+                        chunk_count,
+                        metadata,
+                    )
 
                     chunk_buffer.append(chunk_text)
                     metadata_buffer.append(metadata)
@@ -1210,6 +1407,12 @@ class PDFEmbeddingsConverter:
                 processing_time = time.time() - start_time
                 logger.info(
                     f"Processing completed successfully in {processing_time:.2f}s - {chunk_count} chunks"
+                )
+
+                logger.info(
+                    "Romanian text normalization adjusted %d characters for %s",
+                    getattr(self, "_normalization_changes", 0),
+                    os.path.basename(pdf_path),
                 )
 
                 if progress_callback:
@@ -1488,7 +1691,13 @@ class PDFEmbeddingsConverter:
             "collections": [[item["collection"] for item in top_items]]
         }
 
-    def search_similar(self, query: str, top_k: int = 5, collection_name: str = None):
+    def search_similar(
+        self,
+        query: str,
+        top_k: int = 5,
+        collection_name: str = None,
+        where: Optional[Dict[str, Any]] = None,
+    ):
         """Căutare optimizată cu sortare globală și scoruri"""
         try:
             # Encodează query cu instrucțiunea de retrieval și normalizare
@@ -1530,10 +1739,14 @@ class PDFEmbeddingsConverter:
                     if effective_top_k <= 0:
                         continue
 
-                    results = collection.query(
-                        query_embeddings=query_embedding.tolist(),
-                        n_results=effective_top_k
-                    )
+                    query_kwargs = {
+                        "query_embeddings": query_embedding.tolist(),
+                        "n_results": effective_top_k,
+                    }
+                    if where:
+                        query_kwargs["where"] = where
+
+                    results = collection.query(**query_kwargs)
 
                     if results and results.get('documents') and results['documents'][0]:
                         docs = results["documents"][0]
@@ -1580,7 +1793,7 @@ class PDFEmbeddingsConverter:
                 unique_items.append(item)
 
             # Returnează top_k global cu format compatibil
-            top_items = unique_items[:top_k]
+            top_items = unique_items[: min(top_k, len(unique_items))]
 
             if top_items:
                 result = {
