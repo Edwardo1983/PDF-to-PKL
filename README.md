@@ -9,6 +9,8 @@ Instrument pentru conversia materialelor educaționale PDF în embeddings Chroma
 | `EMBEDDINGS_DB_PATH` | `./embeddings_db` | Directorul persistent pentru baza Chroma. Este creat automat dacă nu există. |
 | `CHUNK_SIZE` | configurarea din `config.py` (fallback 800 când valoarea introdusă nu este validă) | Dimensiunea chunk-urilor generate din PDF. |
 | `CHUNK_OVERLAP` | configurarea din `config.py` (fallback 120 când valoarea introdusă nu este validă) | Suprapunerea dintre chunk-uri consecutive. |
+| `CHUNK_SIZE_BIBLE` | `2 * CHUNK_SIZE` (implicit) | Dimensiune alternativă a chunk-urilor pentru fișiere ce conțin `Biblia`/`Bible` în nume. |
+| `OVERLAP_BIBLE` | `CHUNK_OVERLAP // 2` (implicit) | Suprapunere dedicată corpusului biblic atunci când este activată optimizarea. |
 | `CHROMA_TELEMETRY` | `0` | Setează `0` pentru a opri telemetria Posthog/Chroma. Orice altă valoare reactivează raportarea anonimă. |
 | `KEYWORD_SWEEP_OUTPUT` | `keyword_sweep.csv` | (Opțional) Path implicit pentru exportul utilitarului de sweep semantic. |
 
@@ -37,6 +39,57 @@ python tools/keyword_sweep.py \
 ```
 
 CSV-ul rezultat conține coloanele: `keyword`, `collection`, `hit_count`, `first_hit_id`, `first_hit_page`, `latency_ms`.
+
+## Schema metadatelor
+
+Toate documentele noi și colecțiile migrate respectă schema standard de mai jos:
+
+| Câmp | Exemplu | Observații |
+|------|---------|------------|
+| `grade` | `clasa_2` | întotdeauna în forma `clasa_X`; `clasa_0` pentru materiale generale. |
+| `subject` | `dezvoltare_personala` | slugificat din directorul disciplinei sau din numele fișierului. |
+| `institution` | `Scoala_de_Muzica_George_Enescu` | extras din arborele de directoare ori din colecție. |
+| `tags` | `['dezvoltare_personala', 'clasa_2', 'scoala_de_muzica_george_enescu']` | include cel puțin subiectul și clasa, valorile sunt slugificate. |
+| `source_file` | `A976.pdf` | doar numele fișierului PDF. |
+| `page` | `12` | pagina de start a chunk-ului (pe lângă `page_from`/`page_to`). |
+| `chunk_index` | `42` | index incremental pentru fiecare chunk din fișier. |
+
+Textul este normalizat Unicode (NFC), cu diacritice românești corectate (`ș`, `ț`, `ă`, `î`, `â`), spații invizibile eliminate și spațiere uniformizată înainte de vectorizare. Logurile raportează sumar câte caractere au fost ajustate pentru fiecare PDF procesat.
+
+### Filtrare în `search_similar`
+
+Funcția `search_similar` acceptă un parametru opțional `where`, transmis mai departe către Chroma. Pentru cazurile educaționale, helperul `where_from(grade, subject)` construiește filtre consistente:
+
+```python
+from pdf_converter_working import where_from
+
+results = converter.search_similar(
+    "responsabilitate și managementul timpului",
+    top_k=5,
+    where=where_from("clasa_2", "dezvoltare_personala"),
+)
+```
+
+Poți furniza filtre personalizate, de exemplu:
+
+```python
+search_similar(
+  "responsabilitate și managementul timpului",
+  top_k=5,
+  where={"grade": "clasa_2", "tags": {"$contains": "dezvoltare_personala"}}
+)
+```
+
+Rezultatele sunt deduplicate pe ID, iar `top_k` este „clamp-uit” la dimensiunea fiecărei colecții (eveniment logat automat).
+
+### Corpusul biblic – reducerea zgomotului
+
+Pentru fișierele care conțin `Biblia`/`Bible` în nume există două abordări complementare:
+
+1. **Opțiunea A (implicită)** – folosește `CHUNK_SIZE_BIBLE` și `OVERLAP_BIBLE` pentru a genera chunk-uri mai mari și mai puțin redundante.
+2. **Opțiunea B** – separă corpusul într-o colecție proprie (prin structura directoarelor) și folosește filtre `where` pe `grade`/`tags` pentru a-l exclude din interogările educaționale.
+
+Logurile indică momentul în care este aplicată configurația specială pentru corpusul biblic.
 
 ## Deploy pe Railway
 
